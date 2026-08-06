@@ -265,22 +265,46 @@ async def cmd_price(message: Message):
 async def cmd_remove_course(message: Message):
     if not admin_only(message):
         return
-    parts = message.text.split()
+    parts = message.text.split(maxsplit=1)
     if len(parts) != 2:
-        await message.answer("Usage: /removecourse <course_id>")
+        await message.answer(
+            "Usage: /removecourse [course_id]\n"
+            "Multiple at once: /removecourse 12,15,20  (comma or space separated)"
+        )
         return
-    course_id, id_error = _parse_id(parts[1])
-    if id_error:
-        await message.answer(id_error)
+
+    raw_ids = [p for p in parts[1].replace(",", " ").split() if p]
+    ids, bad = [], []
+    for raw in raw_ids:
+        cid, err = _parse_id(raw)
+        if err:
+            bad.append(raw)
+        else:
+            ids.append(cid)
+
+    if bad:
+        await message.answer(f"⚠️ Skipping invalid ID(s): {', '.join(bad)}")
+
+    if not ids:
         return
+
+    removed, missing = [], []
     async with async_session() as session:
-        course = await session.get(Course, course_id)
-        if not course:
-            await message.answer("❌ Course ID not found.")
-            return
-        course.is_active = False
+        for cid in ids:
+            course = await session.get(Course, cid)
+            if not course:
+                missing.append(cid)
+                continue
+            course.is_active = False
+            removed.append(f"{cid} — {course.name}")
         await session.commit()
-        await message.answer(f"🗑️ Course hidden: {course.name}")
+
+    reply = ""
+    if removed:
+        reply += f"🗑️ Hidden {len(removed)} course(s):\n" + "\n".join(removed)
+    if missing:
+        reply += ("\n\n" if reply else "") + "❌ Not found: " + ", ".join(str(m) for m in missing)
+    await message.answer(reply or "Nothing removed.")
 
 
 @router.message(Command("setlink"))
