@@ -1,0 +1,909 @@
+import csv
+import io
+from datetime import datetime
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from sqlalchemy import select, func, desc
+
+from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage
+from keyboards import AdminAddCourse, AdminBroadcast
+from config import ADMIN_ID
+
+router = Router()
+
+
+def admin_only(message: Message) -> bool:
+    return message.from_user.id == ADMIN_ID
+
+
+def uid_tag(user_id: int) -> str:
+    """User ID wrapped so a single tap copies it in Telegram."""
+    return f"<code>{user_id}</code>"
+
+
+def _parse_price(txt: str):
+    """Returns (price_or_None, error_message_or_None)."""
+    txt = txt.strip().upper()
+    if txt == "TBD":
+        return None, None
+    try:
+        return float(txt), None
+    except ValueError:
+        return 0, f"⚠️ '{txt}' isn't a valid number. Send a number only (e.g. 350) or type 'TBD'."
+
+
+def _parse_id(txt: str):
+    """Returns (id_or_None, error_message_or_None) — guards against non-numeric IDs."""
+    try:
+        return int(txt.strip()), None
+    except ValueError:
+        return None, f"⚠️ '{txt}' isn't a valid ID. Send a number only."
+
+
+# ================= ADD COURSE =================
+@router.message(Command("addcourse"))
+async def cmd_add_course(message: Message, state: FSMContext):
+    if not admin_only(message):
+        return
+    await state.set_state(AdminAddCourse.name)
+    await message.answer("➕ <b>New Course</b>\n\nSend the course name:")
+
+
+@router.message(AdminAddCourse.name)
+async def add_course_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    await state.set_state(AdminAddCourse.faculty)
+    await message.answer("👨‍🏫 Faculty/Institute name:")
+
+
+@router.message(AdminAddCourse.faculty)
+async def add_course_faculty(message: Message, state: FSMContext):
+    await state.update_data(faculty=message.text.strip())
+    await state.set_state(AdminAddCourse.medium)
+    await message.answer("🌐 Medium (English / Hindi / Both):")
+
+
+@router.message(AdminAddCourse.medium)
+async def add_course_medium(message: Message, state: FSMContext):
+    await state.update_data(medium=message.text.strip())
+    await state.set_state(AdminAddCourse.notes)
+    await message.answer("📝 Short notes/description (or '-' if none):")
+
+
+@router.message(AdminAddCourse.notes)
+async def add_course_notes(message: Message, state: FSMContext):
+    notes = "" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(notes=notes)
+    await state.set_state(AdminAddCourse.price)
+    await message.answer("💰 Price in ₹ (number only, or 'TBD' if not decided yet):")
+
+
+@router.message(AdminAddCourse.price)
+async def add_course_price(message: Message, state: FSMContext):
+    price, error = _parse_price(message.text)
+    if error:
+        await message.answer(error)
+        return  # stay in same state, let them retry
+    await state.update_data(price=price)
+    await state.set_state(AdminAddCourse.section)
+
+    async with async_session() as session:
+        result = await session.execute(select(Section).where(Section.parent_id.isnot(None)))
+        sections = result.scalars().all()
+    listing = "\n".join(f"{s.id} — {s.name}" for s in sections) or "(No sub-sections found in DB)"
+    await message.answer(
+        f"📂 Which section(s)? Send the section ID (comma-separated if the course belongs in multiple sections):\n\n{listing}"
+    )
+
+
+@router.message(AdminAddCourse.section)
+async def add_course_section(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        section_ids = [int(x.strip()) for x in message.text.split(",")]
+    except ValueError:
+        await message.answer("⚠️ Send numbers only, comma-separated. Try again:")
+        return
+
+    async with async_session() as session:
+        course = Course(name=data["name"], faculty=data["faculty"], medium=data["medium"],
+                         notes=data["notes"], price=data["price"])
+        for sid in section_ids:
+            section = await session.get(Section, sid)
+            if section:
+                course.sections.append(section)
+        session.add(course)
+        await session.commit()
+        await session.refresh(course)
+
+    await state.clear()
+    price_tag = f"₹{int(course.price)}" if course.price is not None else "TBD"
+    await message.answer(f"✅ Course added!\n\n📘 {course.name} — {price_tag}\n🆔 Course ID: {course.id}")
+
+
+# ================= QUICK ADD (one-line, using section KEYS) =================
+@router.message(Command("quickadd"))
+async def cmd_quick_add(message: Message):
+    if not admin_only(message):
+        return
+    body = message.text.split(maxsplit=1)
+    if len(body) != 2:
+        await message.answer(
+            "Usage:\n/quickadd Name | Faculty | Medium | Notes | Price(or TBD) | section_key1,section_key2\n\n"
+            "Example:\n/quickadd Polity Crash 2027 | Jatin Gupta | Hindi | Complete crash course | 499 | subj_polity\n\n"
+            "Use /listsectionkeys to see valid section keys."
+        )
+        return
+    parts = [p.strip() for p in body[1].split("|")]
+    if len(parts) != 6:
+        await message.answer("⚠️ Need exactly 6 parts separated by '|': Name | Faculty | Medium | Notes | Price | section_keys")
+        return
+    name, faculty, medium, notes, price_txt, keys_txt = parts
+    price, error = _parse_price(price_txt)
+    if error:
+        await message.answer(error)
+        return
+    section_keys = [k.strip() for k in keys_txt.split(",") if k.strip()]
+
+    async with async_session() as session:
+        result = await session.execute(select(Section))
+        sections_by_key = {s.key: s for s in result.scalars().all()}
+        matched, unmatched = [], []
+        for k in section_keys:
+            if k in sections_by_key:
+                matched.append(sections_by_key[k])
+            else:
+                unmatched.append(k)
+        course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
+        course.sections = matched
+        session.add(course)
+        await session.commit()
+        await session.refresh(course)
+
+    price_tag = f"₹{int(course.price)}" if course.price is not None else "TBD"
+    warn = f"\n⚠️ Unknown section key(s) ignored: {', '.join(unmatched)}" if unmatched else ""
+    await message.answer(
+        f"✅ Course added!\n\n📘 {course.name} — {price_tag}\n🆔 Course ID: {course.id}\n"
+        f"📂 Sections: {', '.join(s.name for s in matched) or '(none — unlisted)'}{warn}"
+    )
+
+
+@router.message(Command("listsectionkeys"))
+async def cmd_list_section_keys(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(select(Section).order_by(Section.parent_id, Section.id))
+        sections = result.scalars().all()
+    lines = ["🔑 <b>Section Keys</b> (use with /quickadd, /movecourse)\n"]
+    for s in sections:
+        tag = " (top-level)" if s.parent_id is None else ""
+        lines.append(f"<code>{s.key}</code> — {s.name}{tag}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= MANUAL GRANT (assign a course to a user without payment flow) =================
+@router.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("Usage: /grant <user_id> <course_id>\n\nDirectly unlocks a course for a user — bypasses payment, shows up in their 'My Courses' immediately.")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    course_id, id_error2 = _parse_id(parts[2])
+    if id_error2:
+        await message.answer(id_error2)
+        return
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        course = await session.get(Course, course_id)
+        if not user:
+            await message.answer("❌ User not found (they must /start the bot at least once first).")
+            return
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        existing = await session.execute(
+            select(UserCourse).where(UserCourse.user_id == user_id, UserCourse.course_id == course_id)
+        )
+        if existing.scalar_one_or_none():
+            await message.answer("ℹ️ This user already owns this course.")
+            return
+        session.add(UserCourse(user_id=user_id, course_id=course_id))
+        await session.commit()
+
+    try:
+        group_text = (
+            f"🎉 Professor has assigned you <b>{course.name}</b>!\n\n"
+            + (f"Join the group here: {course.group_link}" if course.group_link
+               else "The group link will be added shortly — check 'My Courses' again soon.")
+        )
+        await message.bot.send_message(user_id, group_text)
+    except Exception:
+        pass
+    await message.answer(f"✅ Granted {course.name} (ID {course.id}) to user {uid_tag(user_id)}.")
+
+
+# ================= QUICK COMMANDS =================
+@router.message(Command("price"))
+async def cmd_price(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 3:
+        await message.answer("Usage: /price <course_id> <new_price_or_TBD>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    price, error = _parse_price(parts[2])
+    if error:
+        await message.answer(error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        course.price = price
+        await session.commit()
+        tag = f"₹{int(price)}" if price is not None else "TBD"
+        await message.answer(f"✅ Price updated: {course.name} → {tag}")
+
+
+@router.message(Command("removecourse"))
+async def cmd_remove_course(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /removecourse <course_id>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        course.is_active = False
+        await session.commit()
+        await message.answer(f"🗑️ Course hidden: {course.name}")
+
+
+@router.message(Command("setlink"))
+async def cmd_set_link(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer("Usage: /setlink <course_id> <group_link>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        course.group_link = parts[2].strip()
+        await session.commit()
+        await message.answer(f"🔗 Group link set: {course.name}")
+
+
+@router.message(Command("trending_add"))
+async def cmd_trending_add(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /trending_add <course_id>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        course.is_trending = True
+        await session.commit()
+        await message.answer(f"🔥 Added to trending: {course.name}")
+
+
+@router.message(Command("trending_remove"))
+async def cmd_trending_remove(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /trending_remove <course_id>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        course.is_trending = False
+        await session.commit()
+        await message.answer(f"➖ Removed from trending: {course.name}")
+
+
+@router.message(Command("listcourses"))
+async def cmd_list_courses(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(select(Course).where(Course.is_active == True))  # noqa: E712
+        courses = result.scalars().all()
+    if not courses:
+        await message.answer("No courses found.")
+        return
+    lines = []
+    for c in courses:
+        tag = f"₹{int(c.price)}" if c.price is not None else "TBD"
+        star = "🔥" if c.is_trending else ""
+        lines.append(f"{c.id}. {star}{c.name} — {tag}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: MOVE COURSE (reassign sections) =================
+@router.message(Command("movecourse"))
+async def cmd_move_course(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer(
+            "Usage: /movecourse <course_id> <section_id1,section_id2,...>\n"
+            "Replaces the course's current section(s) with the ones you list. "
+            "Use /listsections to see section IDs."
+        )
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    try:
+        section_ids = [int(x.strip()) for x in parts[2].split(",")]
+    except ValueError:
+        await message.answer("⚠️ Section IDs must be numbers, comma-separated.")
+        return
+
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        new_sections = []
+        for sid in section_ids:
+            sec = await session.get(Section, sid)
+            if sec:
+                new_sections.append(sec)
+        course.sections = new_sections
+        await session.commit()
+        names = ", ".join(s.name for s in new_sections) or "(none — course is now unlisted)"
+        await message.answer(f"📂 {course.name} moved to: {names}")
+
+
+@router.message(Command("listsections"))
+async def cmd_list_sections(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(select(Section).where(Section.parent_id.isnot(None)))
+        sections = result.scalars().all()
+    lines = [f"{s.id} — {s.name}" for s in sections]
+    text = "📂 <b>Sections</b>\n\n" + "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: PENDING ORDERS QUICK VIEW =================
+@router.message(Command("pending"))
+async def cmd_pending(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(Order, Course, User)
+            .join(Course, Order.course_id == Course.id)
+            .join(User, Order.user_id == User.id)
+            .where(Order.status == "pending")
+            .order_by(Order.created_at)
+        )
+        rows = result.all()
+    if not rows:
+        await message.answer("✅ No pending orders right now.")
+        return
+    lines = ["⏳ <b>Pending Orders</b>\n"]
+    for order, course, user in rows:
+        lines.append(
+            f"#{order.id} — {course.name} — @{user.username or '—'} (ID {uid_tag(user.id)}) — "
+            f"{order.created_at.strftime('%d %b, %H:%M')}"
+        )
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: USER LOOKUP =================
+@router.message(Command("userinfo"))
+async def cmd_user_info(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /userinfo <user_id>")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("❌ User not found.")
+            return
+        courses_result = await session.execute(
+            select(Course).join(UserCourse, UserCourse.course_id == Course.id).where(UserCourse.user_id == user_id)
+        )
+        courses = courses_result.scalars().all()
+        orders_result = await session.execute(select(func.count(Order.id)).where(Order.user_id == user_id))
+        order_count = orders_result.scalar()
+
+        activity_result = await session.execute(
+            select(UserActivity).where(UserActivity.user_id == user_id).order_by(desc(UserActivity.created_at)).limit(8)
+        )
+        activity_rows = activity_result.scalars().all()
+
+    course_lines = "\n".join(f"• {c.name} (ID {c.id})" for c in courses) or "None yet"
+    activity_lines = "\n".join(
+        f"• {a.step} ({a.created_at.strftime('%d %b, %H:%M')})" for a in activity_rows
+    ) or "No activity logged yet."
+
+    await message.answer(
+        f"👤 <b>{user.first_name or '—'}</b> (@{user.username or '—'})\n"
+        f"🆔 ID: {uid_tag(user.id)}\n"
+        f"📅 Joined: {user.joined_at.strftime('%d %b %Y') if user.joined_at else '—'}\n"
+        f"🚫 Banned: {'Yes' if user.is_banned else 'No'}\n"
+        f"✅ Backup channel verified: {'Yes' if user.has_joined_backup_channel else 'No'}\n"
+        f"🧾 Total orders placed: {order_count}\n\n"
+        f"📘 <b>Courses owned:</b>\n{course_lines}\n\n"
+        f"🕘 <b>Recent steps:</b>\n{activity_lines}"
+    )
+
+
+# ================= NEW: USER ACTIVITY (step tracking) =================
+@router.message(Command("activity"))
+async def cmd_activity(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /activity <user_id>")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserActivity).where(UserActivity.user_id == user_id).order_by(desc(UserActivity.created_at)).limit(30)
+        )
+        rows = result.scalars().all()
+    if not rows:
+        await message.answer("No activity logged for this user yet.")
+        return
+    lines = [f"🕘 <b>Recent steps — {uid_tag(user_id)}</b>\n"]
+    for a in rows:
+        lines.append(f"• {a.step} — {a.created_at.strftime('%d %b, %H:%M')}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: CONTACT HISTORY =================
+@router.message(Command("contacthistory"))
+async def cmd_contact_history(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /contacthistory <user_id>")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContactMessage).where(ContactMessage.user_id == user_id).order_by(ContactMessage.created_at)
+        )
+        rows = result.scalars().all()
+    if not rows:
+        await message.answer("No contact messages with this user yet.")
+        return
+    lines = [f"💬 <b>Contact history — {uid_tag(user_id)}</b>\n"]
+    for m in rows:
+        arrow = "👤→🧑‍🏫" if m.direction == "in" else "🧑‍🏫→👤"
+        lines.append(f"{arrow} {m.content} ({m.created_at.strftime('%d %b, %H:%M')})")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: EXPORT (CSV) =================
+@router.message(Command("export"))
+async def cmd_export(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(select(User))
+        users = result.scalars().all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "username", "first_name", "joined_at", "is_banned", "backup_channel_verified"])
+    for u in users:
+        writer.writerow([u.id, u.username or "", u.first_name or "",
+                          u.joined_at.isoformat() if u.joined_at else "", u.is_banned, u.has_joined_backup_channel])
+
+    file_bytes = buf.getvalue().encode("utf-8")
+    await message.answer_document(
+        BufferedInputFile(file_bytes, filename=f"users_export_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"),
+        caption=f"📤 Exported {len(users)} users."
+    )
+
+
+# ================= NEW: TOP COURSES =================
+@router.message(Command("topcourses"))
+async def cmd_top_courses(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(Course.name, func.count(UserCourse.id).label("cnt"))
+            .join(UserCourse, UserCourse.course_id == Course.id)
+            .group_by(Course.id, Course.name)
+            .order_by(desc("cnt"))
+            .limit(10)
+        )
+        rows = result.all()
+    if not rows:
+        await message.answer("No course grants yet.")
+        return
+    lines = ["🏆 <b>Top Courses (by grants)</b>\n"]
+    for i, (name, cnt) in enumerate(rows, 1):
+        lines.append(f"{i}. {name} — {cnt} students")
+    await message.answer("\n".join(lines))
+
+
+# ================= NEW: RECENT USERS =================
+@router.message(Command("recentusers"))
+async def cmd_recent_users(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(select(User).order_by(desc(User.joined_at)).limit(15))
+        users = result.scalars().all()
+    if not users:
+        await message.answer("No users yet.")
+        return
+    lines = ["🆕 <b>Recent Users</b>\n"]
+    for u in users:
+        lines.append(
+            f"• {u.first_name or '—'} (@{u.username or '—'}) — {uid_tag(u.id)} — "
+            f"{u.joined_at.strftime('%d %b, %H:%M') if u.joined_at else '—'}"
+        )
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: FIND COURSE (search by keyword) =================
+@router.message(Command("findcourse"))
+async def cmd_find_course(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /findcourse <keyword>")
+        return
+    keyword = parts[1].strip().lower()
+    async with async_session() as session:
+        result = await session.execute(select(Course))
+        all_courses = result.scalars().all()
+    matches = [c for c in all_courses if keyword in c.name.lower() or keyword in (c.faculty or "").lower()]
+    if not matches:
+        await message.answer("No matching courses found.")
+        return
+    lines = [f"🔎 <b>Matches for '{parts[1].strip()}'</b>\n"]
+    for c in matches[:40]:
+        tag = f"₹{int(c.price)}" if c.price is not None else "TBD"
+        active = "" if c.is_active else " (hidden)"
+        sections = ", ".join(s.name for s in c.sections) or "—"
+        lines.append(f"{c.id}. {c.name} — {tag}{active}\n   📂 {sections}")
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await message.answer(text[i:i + 3500])
+
+
+# ================= NEW: COURSE INFO (detail lookup) =================
+@router.message(Command("courseinfo"))
+async def cmd_course_info(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /courseinfo <course_id>")
+        return
+    course_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        course = await session.get(Course, course_id)
+        if not course:
+            await message.answer("❌ Course ID not found.")
+            return
+        owners_result = await session.execute(select(func.count(UserCourse.id)).where(UserCourse.course_id == course_id))
+        owner_count = owners_result.scalar()
+
+    tag = f"₹{int(course.price)}" if course.price is not None else "TBD"
+    sections = ", ".join(s.name for s in course.sections) or "— (unlisted)"
+    await message.answer(
+        f"📘 <b>{course.name}</b>\n"
+        f"🆔 Course ID: {course.id}\n"
+        f"👨‍🏫 Faculty: {course.faculty or '—'}\n"
+        f"🌐 Medium: {course.medium or '—'}\n"
+        f"📝 Notes: {course.notes or '—'}\n"
+        f"💰 Price: {tag}\n"
+        f"🔗 Group link: {course.group_link or 'Not set — /setlink'}\n"
+        f"🔥 Trending: {'Yes' if course.is_trending else 'No'}\n"
+        f"✅ Active: {'Yes' if course.is_active else 'No (hidden)'}\n"
+        f"📂 Sections: {sections}\n"
+        f"🎓 Students granted: {owner_count}"
+    )
+
+
+# ================= NEW: REVENUE ESTIMATE =================
+@router.message(Command("revenue"))
+async def cmd_revenue(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        result = await session.execute(
+            select(Course.price)
+            .join(UserCourse, UserCourse.course_id == Course.id)
+        )
+        prices = [p for (p,) in result.all() if p is not None]
+        pending_result = await session.execute(select(func.count(Order.id)).where(Order.status == "pending"))
+        pending_count = pending_result.scalar()
+
+    total = sum(float(p) for p in prices)
+    await message.answer(
+        "💰 <b>Revenue Estimate</b>\n\n"
+        f"✅ Approved sales: {len(prices)}\n"
+        f"💵 Estimated total (from approved orders): ₹{int(total)}\n"
+        f"⏳ Orders still pending review: {pending_count}\n\n"
+        "This counts approved course grants only, at each course's current listed price."
+    )
+
+
+# ================= ORDER APPROVE/REJECT =================
+@router.callback_query(F.data.startswith("adm_ok:"))
+async def cb_approve(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("This is for Professor only.", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    async with async_session() as session:
+        order = await session.get(Order, order_id)
+        if not order or order.status != "pending":
+            await call.answer("This order has already been processed.", show_alert=True)
+            return
+        order.status = "approved"
+        order.decided_at = datetime.utcnow()
+        session.add(UserCourse(user_id=order.user_id, course_id=order.course_id))
+        await session.commit()
+        course = await session.get(Course, order.course_id)
+
+    if call.message.caption:
+        await call.message.edit_caption(caption=call.message.caption + "\n\n✅ APPROVED")
+    else:
+        await call.message.edit_text(call.message.text + "\n\n✅ APPROVED")
+
+    group_text = (
+        f"🎉 <b>{course.name}</b> has been approved!\n\n"
+        + (f"Join the group here: {course.group_link}" if course.group_link
+           else "The group link will be added shortly — check 'My Courses' again soon.")
+    )
+    await call.bot.send_message(order.user_id, group_text)
+    await call.answer("Approved ✅")
+
+
+@router.callback_query(F.data.startswith("adm_no:"))
+async def cb_reject(call: CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("This is for Professor only.", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    async with async_session() as session:
+        order = await session.get(Order, order_id)
+        if not order or order.status != "pending":
+            await call.answer("This order has already been processed.", show_alert=True)
+            return
+        order.status = "rejected"
+        order.decided_at = datetime.utcnow()
+        await session.commit()
+
+    if call.message.caption:
+        await call.message.edit_caption(caption=call.message.caption + "\n\n❌ REJECTED")
+    else:
+        await call.message.edit_text(call.message.text + "\n\n❌ REJECTED")
+
+    await call.bot.send_message(
+        order.user_id,
+        "❌ The gift card couldn't be verified. Please try again with the correct code/photo, "
+        "or contact Professor via the Help section.",
+    )
+    await call.answer("Rejected ❌")
+
+
+# ================= BROADCAST =================
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, state: FSMContext):
+    if not admin_only(message):
+        return
+    await state.set_state(AdminBroadcast.waiting_message)
+    await message.answer("📢 Send the broadcast message (text/photo/anything) — it will go to all users:")
+
+
+@router.message(AdminBroadcast.waiting_message)
+async def do_broadcast(message: Message, state: FSMContext):
+    await state.clear()
+    async with async_session() as session:
+        result = await session.execute(select(User.id).where(User.is_banned == False))  # noqa: E712
+        user_ids = [row[0] for row in result.all()]
+
+    sent, failed = 0, 0
+    status_msg = await message.answer(f"📤 Sending... 0/{len(user_ids)}")
+    for uid in user_ids:
+        try:
+            await message.copy_to(chat_id=uid)
+            sent += 1
+        except Exception:
+            failed += 1
+    await status_msg.edit_text(f"✅ Broadcast complete!\nSent: {sent} | Failed: {failed}")
+
+
+# ================= STATS =================
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not admin_only(message):
+        return
+    async with async_session() as session:
+        total_users = (await session.execute(select(func.count(User.id)))).scalar()
+        banned = (await session.execute(select(func.count(User.id)).where(User.is_banned == True))).scalar()  # noqa
+        total_courses = (await session.execute(select(func.count(Course.id)).where(Course.is_active == True))).scalar()  # noqa
+        pending_orders = (await session.execute(select(func.count(Order.id)).where(Order.status == "pending"))).scalar()
+        approved_orders = (await session.execute(select(func.count(Order.id)).where(Order.status == "approved"))).scalar()
+        rejected_orders = (await session.execute(select(func.count(Order.id)).where(Order.status == "rejected"))).scalar()
+        total_sales = (await session.execute(select(func.count(UserCourse.id)))).scalar()
+
+    await message.answer(
+        "📊 <b>Bot Stats</b>\n\n"
+        f"👥 Total Users: {total_users}\n🚫 Banned: {banned}\n📘 Active Courses: {total_courses}\n\n"
+        f"⏳ Pending Orders: {pending_orders}\n✅ Approved: {approved_orders}\n❌ Rejected: {rejected_orders}\n"
+        f"🎓 Total Course Grants: {total_sales}"
+    )
+
+
+# ================= BAN / UNBAN =================
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /ban <user_id>")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("❌ User not found.")
+            return
+        user.is_banned = True
+        await session.commit()
+        await message.answer(f"🚫 User {parts[1]} banned.")
+
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if not admin_only(message):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Usage: /unban <user_id>")
+        return
+    user_id, id_error = _parse_id(parts[1])
+    if id_error:
+        await message.answer(id_error)
+        return
+    async with async_session() as session:
+        user = await session.get(User, user_id)
+        if not user:
+            await message.answer("❌ User not found.")
+            return
+        user.is_banned = False
+        await session.commit()
+        await message.answer(f"✅ User {parts[1]} unbanned.")
+
+
+@router.message(Command("adminhelp"))
+async def cmd_admin_help(message: Message):
+    if not admin_only(message):
+        return
+    await message.answer(
+        "🛠 <b>Admin Commands</b>\n\n"
+        "<b>Courses</b>\n"
+        "/addcourse — add a new course (step-by-step)\n"
+        "/quickadd Name | Faculty | Medium | Notes | Price|TBD | section_keys — add a course in ONE message\n"
+        "/listsectionkeys — see all section keys (for /quickadd, /movecourse)\n"
+        "/price &lt;id&gt; &lt;price|TBD&gt; — change price\n"
+        "/removecourse &lt;id&gt; — hide a course\n"
+        "/setlink &lt;id&gt; &lt;group_link&gt; — set a course's group link\n"
+        "/movecourse &lt;id&gt; &lt;section_id1,section_id2,...&gt; — reassign a course's section(s)\n"
+        "/listsections — list all section IDs\n"
+        "/trending_add &lt;id&gt; — add to trending\n"
+        "/trending_remove &lt;id&gt; — remove from trending\n"
+        "/listcourses — list all course IDs + prices\n"
+        "/grant &lt;user_id&gt; &lt;course_id&gt; — manually unlock a course for a user (no payment needed)\n\n"
+        "<b>Orders &amp; Users</b>\n"
+        "/pending — quick view of orders awaiting approval\n"
+        "/userinfo &lt;user_id&gt; — look up a user, their courses + recent steps\n"
+        "/activity &lt;user_id&gt; — full recent step-by-step trail for a user\n"
+        "/contacthistory &lt;user_id&gt; — full Contact Professor thread with a user\n"
+        "/revenue — approved-sales revenue estimate\n"
+        "/ban &lt;user_id&gt; — block a user\n"
+        "/unban &lt;user_id&gt; — unblock a user\n\n"
+        "<b>Discovery &amp; Reports</b>\n"
+        "/findcourse &lt;keyword&gt; — search courses by name/faculty\n"
+        "/courseinfo &lt;id&gt; — full detail + student count for one course\n"
+        "/topcourses — best-selling courses\n"
+        "/recentusers — last 15 users who joined\n"
+        "/export — download all users as a CSV file\n\n"
+        "<b>Replying to users</b>\n"
+        "Just hit Reply (Telegram's native reply) on any forwarded order or "
+        "'Contact Professor' message — your reply is delivered to that user automatically.\n\n"
+        "<b>Broadcast &amp; Stats</b>\n"
+        "/broadcast — message all users\n"
+        "/stats — bot-wide numbers"
+    )
