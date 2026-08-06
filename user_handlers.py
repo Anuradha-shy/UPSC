@@ -60,7 +60,6 @@ async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
         f"🆔 User ID: {uid_tag(tg_user.id)}\n"
         f"🌐 Language: {tg_user.language_code or '—'}\n"
         f"📅 First seen: {user.joined_at.strftime('%d %b %Y, %H:%M UTC') if user.joined_at else '—'}"
-        f"✅ Backup channel verified: {'Yes' if user.has_joined_backup_channel else 'No'}"
     )
     try:
         await bot.send_message(ADMIN_ID, text)
