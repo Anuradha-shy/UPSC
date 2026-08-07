@@ -462,6 +462,10 @@ async def cmd_apply_promo(message: Message, state: FSMContext):
 
 MAX_GIFT_CARD_MESSAGES = 3
 
+# ==============================================================================
+# 💳 WORLD-LEVEL PAYMENT & GIFT CARD PROOF HANDLER (MERGED & OPTIMIZED)
+# ==============================================================================
+
 @router.message(BuyFlow.waiting_for_gift_card, F.photo | F.text | F.document)
 async def receive_gift_card_proof(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -470,42 +474,84 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
     msg_count = data.get("msg_count", 0)
     attempt = data.get("attempt", 0) + 1
     
-    # 🛡️ 4 MESSAGE PAYMENT VALIDATION LIMIT (Anti-Spam)
+    # 🛡️ 4 MESSAGE PAYMENT VALIDATION LIMIT (Anti-Spam / Anti-Bruteforce)
     if attempt > 4:
         await state.clear()
-        return await message.answer("❌ <b>Session Cancelled:</b> Aapne 4 invalid attempts kiye hain. Kripya menu se phir se course select karein.", parse_mode="HTML")
+        return await message.answer(
+            "❌ <b>Session Cancelled:</b> Aapne 4 invalid attempts kiye hain. "
+            "Kripya menu se phir se course select karein aur valid payment proof bhejein.", 
+            parse_mode="HTML"
+        )
         
     await state.update_data(attempt=attempt)
 
     code_text = ""
     kind, content = "", ""
+    payment_mode_tag = "UNKNOWN"
 
     if message.photo:
         kind, content = "photo", message.photo[-1].file_id
-        # Trigger AI OCR if photo is sent
-        scan_msg = await message.answer("🔍 <i>AI OCR is scanning your image...</i>", parse_mode="HTML")
-        code_text = await scan_image_for_code(message.bot, content)
+        scan_msg = await message.answer("🔍 <i>Professor AI: Inspecting payment proof & scanning details...</i>", parse_mode="HTML")
+        
+        # 🌐 World-Level Universal Payment & OCR Inspector
+        from security import inspect_payment_proof
+        scan_result = await inspect_payment_proof(message.bot, content)
         await scan_msg.delete()
+        
+        # Rule 1: Auto-Reject fake, random or non-payment images (Without blocking user)
+        if not scan_result["valid"] or scan_result["type"] == "INVALID":
+            remaining_attempts = 4 - attempt
+            await message.answer(
+                "❌ <b>Invalid Payment Proof Detected!</b>\n\n"
+                "Aapki image mein koi valid <b>Amazon Pay Gift Card</b> ya <b>UPI Payment screenshot</b> nahi mila.\n"
+                "Kripya saaf screenshot bhejein jisme Transaction ID ya Voucher Code clear dikh raha ho. "
+                f"(Aapko block nahi kiya gaya hai — Attempt {attempt}/4, {remaining_attempts} attempts left)",
+                parse_mode="HTML",
+                reply_markup=gift_card_collect_kb()
+            )
+            return
+
+        payment_mode_tag = scan_result["type"] # 'GIFT_CARD' or 'UPI_PAYMENT'
+        code_text = scan_result.get("data", "")
+
     elif message.document:
         kind, content = "document", message.document.file_id
+        payment_mode_tag = "DOCUMENT_VOUCHER"
     else:
         kind, content = "text", message.text
         code_text = message.text
+        payment_mode_tag = "TEXT_CODE"
+        
+        # Alphanumeric Validation for Direct Text Amazon Pay Codes (14-digit format)
+        if not re.match(r"^[A-Z0-9]{14}$", code_text.upper()):
+            remaining_attempts = 4 - attempt
+            await message.answer(
+                f"⚠️ <b>Invalid Code Format!</b>\n"
+                f"Amazon Pay code 14-digit alphanumeric hona chahiye.\n"
+                f"(Attempt {attempt}/4 — {remaining_attempts} attempts left)",
+                parse_mode="HTML"
+            )
+            try:
+                await message.bot.send_message(
+                    ADMIN_ID, 
+                    f"⚠️ User {uid_tag(message.from_user.id)} provided invalid text format:\nInput: <code>{code_text}</code>", 
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            return
 
-    # Alphanumeric Validation for Amazon Pay
-    if kind == "text" and not re.match(r"^[A-Z0-9]{14}$", code_text.upper()):
-        await message.answer(f"⚠️ Invalid Format! Attempt ({attempt}/4).\nSahi 14-digit code ya clear photo bhejein.")
-        # Super Feature: Notify admin quietly about invalid attempts
-        try:
-            await message.bot.send_message(ADMIN_ID, f"⚠️ User {uid_tag(message.from_user.id)} provided invalid code format:\nInput: <code>{code_text}</code>", parse_mode="HTML")
-        except: pass
-        return
-
+    # Database Order Creation / Association
     async with async_session() as session:
         course = await session.get(Course, course_id)
         if order_id is None:
-            order = Order(user_id=message.from_user.id, course_id=course_id, submission_type=kind,
-                           submission_content=str(content), status="pending")
+            order = Order(
+                user_id=message.from_user.id, 
+                course_id=course_id, 
+                submission_type=kind,
+                submission_content=str(content), 
+                status="pending"
+            )
             session.add(order)
             await session.commit()
             await session.refresh(order)
@@ -513,13 +559,16 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
 
     msg_count += 1
     await state.update_data(order_id=order_id, msg_count=msg_count)
-    await log_step(message.from_user.id, f"Sent gift-card proof #{msg_count} for order #{order_id} ({course.name})")
+    await log_step(message.from_user.id, f"Sent verified payment proof #{msg_count} for order #{order_id} ({course.name})")
 
     price_to_show = f"₹{int(data.get('price', course.price))}" if course.price is not None else "TBD"
 
+    # Admin Notification Formatting with Payment Mode Badge
+    mode_badge = "🎁 Amazon Pay Gift Card" if payment_mode_tag == "GIFT_CARD" else ("⚡ UPI Payment (₹10+ Extra Charge)" if payment_mode_tag == "UPI_PAYMENT" else "📄 Document/Text")
+
     if msg_count == 1:
         admin_caption = (
-            "🔔 <b>New Order — Verification Needed</b>\n\n"
+            "🔔 <b>New Verified Order — Action Needed</b>\n\n"
             f"🧾 Order ID: #{order_id}\n"
             f"👤 Name: {message.from_user.full_name}\n"
             f"🔗 Username: @{message.from_user.username or '—'}\n"
@@ -527,10 +576,11 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
             f"📘 Course: {course.name}\n"
             f"🆔 Course ID: {course.id}\n"
             f"💰 Final Price: {price_to_show}\n"
+            f"💳 Payment Mode: <b>{mode_badge}</b>\n"
             f"📎 Message 1/{MAX_GIFT_CARD_MESSAGES}"
         )
         if code_text and kind != "document":
-            admin_caption += f"\n\n🤖 OCR/Code Result: <code>{code_text}</code>"
+            admin_caption += f"\n\n🤖 Extracted Data/Code: <code>{code_text}</code>"
 
         kb = admin_order_decision_kb(order_id)
     else:
@@ -540,6 +590,7 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         )
         kb = None
 
+    # Forward Proof to Admin Safely
     try:
         if kind == "text":
             admin_caption += f"\n\n🎁 Content:\n<code>{content}</code>"
@@ -549,22 +600,32 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         else:
             await message.bot.send_document(ADMIN_ID, document=content, caption=admin_caption, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        logger.exception("Failed to forward gift card proof to admin")
+        logger.exception("Failed to forward payment proof to admin")
+
+    # User Notification based on Payment Type
+    if payment_mode_tag == "UPI_PAYMENT":
+        await message.answer(
+            "✅ <b>UPI Payment Received!</b>\n"
+            "Note: UPI payments par ₹10+ extra charge applicable hota hai.\n"
+            "Aapka proof Professor ke paas bhej diya gaya hai. Verify hote hi course 'My Courses' mein mil jayega!",
+            parse_mode="HTML"
+        )
 
     if msg_count >= MAX_GIFT_CARD_MESSAGES:
         await state.clear()
         await message.answer(
-            "✅ Got all your messages — sent to Professor for verification.\n"
-            "You'll get a notification once it's approved, and the course will appear under 'My Courses' 🎉",
+            "✅ Sabhi messages mil gaye hain — Professor ko verification ke liye bhej diye gaye hain.\n"
+            "Approve hote hi course aapke 'My Courses' section mein show hone lagega 🎉",
             reply_markup=main_menu_kb(),
         )
     else:
         remaining = MAX_GIFT_CARD_MESSAGES - msg_count
         await message.answer(
             f"✅ Received (message {msg_count}/{MAX_GIFT_CARD_MESSAGES}). "
-            f"You can send up to {remaining} more, or tap 'Done' below when finished.",
+            f"Aap {remaining} messages aur bhej sakte hain, ya niche 'Done' tap karein.",
             reply_markup=gift_card_collect_kb(),
         )
+        
 
 
 @router.callback_query(F.data == "gcdone")
