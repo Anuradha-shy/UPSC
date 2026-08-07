@@ -59,7 +59,6 @@ class Course(Base):
     medium = Column(String(50), default="")
     notes = Column(Text, default="")
     price = Column(Numeric(10, 2), nullable=True)   # NULL = "Coming Soon"
-    batch_id = Column(String(20), nullable=True, unique=True)  # e.g. "CSE-014" — shown to admin on every order
     group_link = Column(String(300), nullable=True)
     is_trending = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
@@ -154,30 +153,7 @@ OPTIONAL_SUBJECTS = [
     "Anthropology", "PSIR", "Sociology", "History", "Geography", "Philosophy",
     "Public Administration", "Psychology", "Commerce & Accountancy",
     "Hindi Literature", "Mathematics", "Economics", "Law", "Forestry",
-    "Geology", "Agriculture", "Physics",
-]
-
-# NET/JRF subject-wise leaves (parented under the "net_jrf" top section
-# alongside the existing "net_jrf_all"). Keys match exactly what
-# COURSE_SEED uses to tag courses — every one of these MUST exist for those
-# courses to be visible anywhere in the bot (kept as explicit (key, name)
-# pairs rather than auto-slugged, since "Paper 1" -> "net_jrf_paper1" isn't
-# what a generic slugger would produce).
-NET_JRF_SUBJECTS = [
-    ("net_jrf_commerce", "Commerce"),
-    ("net_jrf_computer_science", "Computer Science"),
-    ("net_jrf_education", "Education"),
-    ("net_jrf_english", "English"),
-    ("net_jrf_geography", "Geography"),
-    ("net_jrf_history", "History"),
-    ("net_jrf_home_science", "Home Science"),
-    ("net_jrf_law", "Law"),
-    ("net_jrf_management", "Management"),
-    ("net_jrf_philosophy", "Philosophy"),
-    ("net_jrf_polity", "Polity"),
-    ("net_jrf_psychology", "Psychology"),
-    ("net_jrf_public_administration", "Public Administration"),
-    ("net_jrf_sociology", "Sociology"),
+    "Geology", "Agriculture",
 ]
 
 # ---- v2 home-screen structure ----
@@ -201,9 +177,16 @@ SECTION_TREE = {
         ("upsc_ts_mains", "Mains Test Series", "📝"),
     ],
     ("subject_specific", "Subject Specific Course", "🧑‍🏫"): [
+        ("subj_economy", "Economics (incl. Mrunal)", "💹"),
+        ("subj_geography", "Geography (incl. Sudarshan Gujjar)", "🗺"),
+        ("subj_polity", "Polity & Governance (incl. Jatin Gupta)", "🏛"),
+        ("subj_environment_scitech", "Environment + Sci-Tech", "🌱"),
+        ("subj_history", "History", "📜"),
+        ("subj_ir", "International Relations", "🌐"),
+        ("subj_public_admin", "Public Administration", "🏢"),
         ("upsc_ethics", "Ethics (GS-4)", "⚖️"),
         ("upsc_essay", "Essay", "✍️"),
-        ("upsc_subject_specific", "Subject Specific Course", "📚"),
+        ("upsc_subject_specific", "Other Subject Courses", "📚"),
     ],
     ("upsc_optional", "UPSC Optional", "📗"): [
         (f"optional_{_slug(s)}", s, "📗") for s in OPTIONAL_SUBJECTS
@@ -217,7 +200,6 @@ SECTION_TREE = {
     ],
     ("net_jrf", "NET / JRF", "🎓"): [
         ("net_jrf_all", "All Subjects", "🎓"),
-        *[(key, name, "🎓") for key, name in NET_JRF_SUBJECTS],
     ],
     ("combo", "Combo Deals & Bundles", "🎁"): [
         ("combo_deals", "Combo Deals", "🎁"),
@@ -256,8 +238,8 @@ async def seed_courses():
         result = await session.execute(select(Section))
         sections_by_key = {s.key: s for s in result.scalars().all()}
 
-        for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
-            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price, batch_id=batch_id)
+        for name, faculty, medium, notes, price, section_keys in COURSE_SEED:
+            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
             for key in section_keys:
                 sec = sections_by_key.get(key)
                 if sec:
@@ -273,15 +255,15 @@ NEW_TOP_SECTIONS = [
     ("subject_specific", "Subject Specific Course", "🧑‍🏫"),
 ]
 
-# NEW_SUBJECT_CHILDREN is intentionally empty — the fine-grained subject
-# split (subj_economy, subj_geography, subj_polity, subj_environment_scitech,
-# subj_history, subj_ir, subj_public_admin) was reverted per request:
-# clicking "Subject Specific" now shows one flat, minimalist course list
-# again instead of per-subject sub-buttons. migrate_v5() below merges any
-# courses an earlier deploy had already split into those sections back into
-# upsc_subject_specific and retires the now-empty sections. Kept as an
-# empty list (not deleted) so migrate_v2()'s loop below stays valid.
-NEW_SUBJECT_CHILDREN = []
+NEW_SUBJECT_CHILDREN = [
+    ("subj_economy", "Economics (incl. Mrunal)", "💹"),
+    ("subj_geography", "Geography (incl. Sudarshan Gujjar)", "🗺"),
+    ("subj_polity", "Polity & Governance (incl. Jatin Gupta)", "🏛"),
+    ("subj_environment_scitech", "Environment + Sci-Tech", "🌱"),
+    ("subj_history", "History", "📜"),
+    ("subj_ir", "International Relations", "🌐"),
+    ("subj_public_admin", "Public Administration", "🏢"),
+]
 
 # (section_key_to_reparent, new_parent_key)
 REPARENT = [
@@ -294,15 +276,24 @@ REPARENT = [
     ("upsc_subject_specific", "subject_specific"),
 ]
 
-# KEYWORD_SECTION_MAP is intentionally empty for the same reason — it used
-# to additively sort courses into the fine subj_* buckets by keyword; that
-# splitting is reverted, so this loop is now a no-op (kept, not deleted, so
-# migrate_v2()'s step 4 below stays valid code).
-KEYWORD_SECTION_MAP = []
+# keyword -> extra section_key to *add* (additive tagging, never removes the
+# course from wherever it already was) — used to sort the old catch-all
+# "Subject Specific Course" pile into the new finer subject buckets.
+KEYWORD_SECTION_MAP = [
+    (["mrunal", "economy", "economics", "pcb", "shivin", "jayant", "aditya kaliya",
+      "basava", "rishi jain", "bookstawa"], "subj_economy"),
+    (["geography", "gujjar", "gurjar", "thapa", "himanshu"], "subj_geography"),
+    (["polity", "governance", "jatin gupta", "sidharth arora", "laxmikanth"], "subj_polity"),
+    (["environment", "sci-tech", "sci & tech", "science", "ecology", "pmf",
+      "cp kaushik", "ravi agrahari"], "subj_environment_scitech"),
+    (["history"], "subj_history"),
+    (["international relations", "ir ", "chetan"], "subj_ir"),
+    (["public administration", "pub ad"], "subj_public_admin"),
+]
 
 EXPLICIT_NEW_COURSES = [
     # (name, faculty, medium, notes, price, [section_keys])
-    ("Polity & Governance — Jatin Gupta", "Jatin Gupta", "", "", None, ["upsc_subject_specific"]),
+    ("Polity & Governance — Jatin Gupta", "Jatin Gupta", "", "", None, ["subj_polity"]),
 ]
 
 
@@ -389,10 +380,10 @@ async def migrate_v2():
         # file is updated later — never touches an existing course's price).
         result = await session.execute(select(Course.name))
         existing_names = {n for (n,) in result.all()}
-        for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
+        for name, faculty, medium, notes, price, section_keys in COURSE_SEED:
             if name in existing_names:
                 continue
-            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price, batch_id=batch_id)
+            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
             for key in section_keys:
                 sec = sections.get(key)
                 if sec:
@@ -472,158 +463,3 @@ async def migrate_v3():
                 if target_key not in existing_keys:
                     course.sections.append(target_sec)
         await session.commit()
-
-
-# ---------------- v4 migration: NET/JRF subject sections + full catalog sync ----------------
-# Fixes a real bug: COURSE_SEED tags ~30 courses with per-subject NET/JRF
-# section keys (net_jrf_commerce, ...) and one course with "optional_physics"
-# — none of which were ever created as actual Section rows on an
-# already-deployed DB. Those courses were silently inserted with ZERO
-# sections attached, so they existed in the database but were invisible
-# everywhere in the bot. This migration:
-#   1) creates any missing NET/JRF subject sections + "optional_physics"
-#   1c) folds "Paper 1" into net_jrf_all (no dedicated section for it —
-#       moves any courses off a stray net_jrf_paper1 if one was ever created
-#       by an earlier deploy, and retires that section)
-#   2) re-attaches sections to any already-existing course that's missing
-#      one or more of the sections COURSE_SEED says it should have
-#      (additive only — never removes a section a course already has),
-#      and backfills batch_id for any pre-existing course that doesn't
-#      have one yet (never overwrites a batch_id that's already set)
-#   3) adds any COURSE_SEED course that doesn't exist in the DB at all yet
-#   4) soft-deactivates (is_active=False) any legacy course with price
-#      IS NULL — these are the old "no price mentioned" entries that were
-#      superseded once COURSE_SEED became fully priced (233/233 courses,
-#      all priced). Nothing is hard-deleted, so this can be reversed by
-#      flipping is_active back to True if a deactivation was ever wrong.
-# Idempotent — safe to run on every startup.
-async def migrate_v4():
-    async with async_session() as session:
-        result = await session.execute(select(Section))
-        sections = {s.key: s for s in result.scalars().all()}
-        if not sections:
-            return  # DB not seeded yet
-
-        changed = False
-
-        # 1a) optional_physics
-        if "optional_physics" not in sections:
-            parent = sections.get("upsc_optional")
-            if parent:
-                sec = Section(key="optional_physics", name="Physics", emoji="📗", parent_id=parent.id)
-                session.add(sec)
-                await session.flush()
-                sections["optional_physics"] = sec
-                changed = True
-
-        # 1b) NET/JRF subject sections
-        net_jrf_parent = sections.get("net_jrf")
-        if net_jrf_parent:
-            for key, name in NET_JRF_SUBJECTS:
-                if key not in sections:
-                    sec = Section(key=key, name=name, emoji="🎓", parent_id=net_jrf_parent.id)
-                    session.add(sec)
-                    await session.flush()
-                    sections[key] = sec
-                    changed = True
-
-        if changed:
-            await session.commit()
-
-        # 1c) fold "Paper 1" into net_jrf_all instead of its own section —
-        # if an earlier deploy already created net_jrf_paper1, move any
-        # courses off it onto net_jrf_all and retire (deactivate) the
-        # now-empty section rather than leaving a dangling duplicate.
-        stray = sections.get("net_jrf_paper1")
-        all_subjects_sec = sections.get("net_jrf_all")
-        if stray and all_subjects_sec:
-            result = await session.execute(select(Course))
-            for course in result.scalars().all():
-                keys = {s.key for s in course.sections}
-                if "net_jrf_paper1" in keys:
-                    course.sections = [s for s in course.sections if s.key != "net_jrf_paper1"]
-                    if "net_jrf_all" not in keys:
-                        course.sections.append(all_subjects_sec)
-            stray.is_active = False
-            await session.commit()
-
-        # 2) + 3) re-attach missing sections to existing courses, backfill
-        # batch_id for pre-existing courses, and add any COURSE_SEED course
-        # that's completely missing from the DB.
-        result = await session.execute(select(Course))
-        courses_by_name = {c.name: c for c in result.scalars().all()}
-
-        for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
-            # Paper 1 courses now point at net_jrf_all only, never a dedicated section.
-            section_keys = ["net_jrf_all" if k == "net_jrf_paper1" else k for k in section_keys]
-            course = courses_by_name.get(name)
-            if course is None:
-                course = Course(name=name, faculty=faculty, medium=medium, notes=notes,
-                                 price=price, batch_id=batch_id)
-                for key in section_keys:
-                    sec = sections.get(key)
-                    if sec:
-                        course.sections.append(sec)
-                session.add(course)
-            else:
-                if not course.batch_id and batch_id:
-                    course.batch_id = batch_id
-                existing_keys = {s.key for s in course.sections}
-                for key in section_keys:
-                    if key not in existing_keys:
-                        sec = sections.get(key)
-                        if sec:
-                            course.sections.append(sec)
-        await session.commit()
-
-        # 4) deactivate legacy no-price courses
-        result = await session.execute(select(Course).where(Course.price.is_(None), Course.is_active == True))  # noqa: E712
-        for course in result.scalars().all():
-            course.is_active = False
-        await session.commit()
-
-
-# ---------------- v5 migration: un-split "Subject Specific" ----------------
-# Reverts the earlier fine-grained subject split under "Subject Specific"
-# (Economics/Geography/Polity/Environment+Sci-Tech/History/IR/Public Admin
-# as separate sub-buttons) back to one flat, minimalist list — clicking
-# "Subject Specific" now shows every subject-specific course together again,
-# same as the original design. Idempotent and safe on every startup: if a
-# deployed DB never had the split (fresh installs after this change), the
-# "stray" sections below simply won't exist and the loop is a no-op.
-STRAY_SUBJECT_SECTIONS = [
-    "subj_economy", "subj_geography", "subj_polity", "subj_environment_scitech",
-    "subj_history", "subj_ir", "subj_public_admin",
-]
-
-
-async def migrate_v5():
-    async with async_session() as session:
-        result = await session.execute(select(Section))
-        sections = {s.key: s for s in result.scalars().all()}
-        if not sections:
-            return
-
-        catchall = sections.get("upsc_subject_specific")
-        if not catchall:
-            return
-
-        result = await session.execute(select(Course))
-        all_courses = result.scalars().all()
-
-        any_stray_found = False
-        for stray_key in STRAY_SUBJECT_SECTIONS:
-            stray = sections.get(stray_key)
-            if not stray:
-                continue
-            any_stray_found = True
-            for course in all_courses:
-                keys = {s.key for s in course.sections}
-                if stray_key in keys:
-                    course.sections = [s for s in course.sections if s.key != stray_key]
-                    if "upsc_subject_specific" not in {s.key for s in course.sections}:
-                        course.sections.append(catchall)
-            stray.is_active = False
-
-        if any_stray_found:
-            await session.commit()
