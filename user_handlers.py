@@ -1,6 +1,9 @@
 import json
 import logging
+import asyncio
+import re
 from datetime import datetime
+from collections import defaultdict
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -22,13 +25,35 @@ from keyboards import (
     ContactFlow, contact_cancel_kb,
 )
 
+# 🛡️ IMPORTING SECURITY & ADMIN STATES
+from security import scan_image_for_code
+from admin_handlers import AI_STATE, ACTIVE_PROMOS
+
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ================= GLOBAL TRACKERS =================
+# Cooling limit tracker for broadcast replies
+broadcast_reply_counts = defaultdict(int)
 
 def uid_tag(user_id: int) -> str:
     """User ID wrapped so a single tap copies it in Telegram."""
     return f"<code>{user_id}</code>"
+
+
+# ================= CART ABANDONMENT REMINDER TASK =================
+async def cart_abandonment_reminder(bot, user_id, course_name):
+    """Sends a reminder if user stops halfway through payment (4-hour delay)."""
+    await asyncio.sleep(4 * 3600) # Wait 4 hours
+    try:
+        await bot.send_message(
+            user_id, 
+            f"🔔 <b>Reminder:</b> Aapne <b>{course_name}</b> select kiya tha aur payment pending hai.\n\n"
+            f"Agar aapko Amazon Pay Gift Card kharidne mein koi issue aa raha hai, toh kripya Help section se Professor se baat karein!", 
+            parse_mode="HTML"
+        )
+    except Exception: 
+        pass
 
 
 # ================= START / CHANNEL GATE =================
@@ -50,8 +75,7 @@ async def _get_or_create_user(tg_user) -> tuple[User, bool]:
 
 
 async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
-    """Sends the Professor a notification every time someone starts the bot,
-    so admin always knows who's using it — including on repeat visits."""
+    """Sends the Professor a notification every time someone starts the bot."""
     if tg_user.id == ADMIN_ID:
         return
     status_tag = "🆕 New user" if is_new else "🔁 Returning user"
@@ -70,24 +94,17 @@ async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
 
 
 async def _is_member_of_backup_channel(bot, user_id: int) -> bool:
-    """Checks live membership via the Telegram API. Returns False (rather
-    than raising) on any error — including the bot not being an admin in the
-    channel, which is the most common misconfiguration and is logged loudly
-    so it's easy to diagnose from the server logs."""
+    """Checks live membership via the Telegram API."""
     try:
         member = await bot.get_chat_member(chat_id=BACKUP_CHANNEL, user_id=user_id)
         return member.status in ("member", "administrator", "creator")
     except TelegramForbiddenError:
-        logger.error(
-            f"Backup-channel check failed for user {user_id}: bot is not an "
-            f"admin of {BACKUP_CHANNEL}. Add the bot as an admin in that channel."
-        )
+        logger.error(f"Backup-channel check failed for user {user_id}: bot is not an admin of {BACKUP_CHANNEL}.")
         return False
     except TelegramBadRequest:
-        logger.warning(f"Backup-channel check: user {user_id} not found in {BACKUP_CHANNEL} (likely hasn't joined).")
+        logger.warning(f"Backup-channel check: user {user_id} not found in {BACKUP_CHANNEL}.")
         return False
     except Exception:
-        logger.exception(f"Unexpected error checking backup-channel membership for user {user_id}")
         return False
 
 
@@ -101,9 +118,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         await message.answer("🚫 You don't have access to this bot. Contact Professor if you have a query.")
         return
 
-    # Deep-link payload from the Mini App's "Buy Now" button, e.g. "buy_123"
-    # (see webapp_template.py buyCourse()). Stash it — the channel gate below
-    # may need to run first, and we resume the buy screen right after that.
+    # Deep-link payload
     pending_course_id = None
     if command.args and command.args.startswith("buy_"):
         try:
@@ -111,7 +126,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         except ValueError:
             pending_course_id = None
 
-    # Once verified, the gate never shows again — even on repeat /start.
     if not user.has_joined_backup_channel:
         is_member = await _is_member_of_backup_channel(message.bot, message.from_user.id)
         if not is_member:
@@ -284,14 +298,11 @@ async def _trending_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="⬅ Back", callback_data="menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 TRENDING_TEXT = "🔥 <b>Trending Courses</b>\n\n{line}\n\nThe courses in highest demand right now — buy directly from here."
-
 
 @router.message(Command("trending"))
 async def cmd_trending(message: Message):
     await message.answer(TRENDING_TEXT.format(line=get_line()), reply_markup=await _trending_kb())
-
 
 @router.callback_query(F.data == "trending:open")
 async def cb_trending(call: CallbackQuery):
@@ -300,7 +311,7 @@ async def cb_trending(call: CallbackQuery):
     await call.answer()
 
 
-# ================= BUY FLOW =================
+# ================= BUY FLOW & FLASH SALES (PROMO) =================
 def _course_detail_text(course: Course) -> str:
     price_tag = f"₹{int(course.price)}" if course.price is not None else "Price on request — Professor will confirm with you"
     return (
@@ -315,8 +326,6 @@ def _course_detail_text(course: Course) -> str:
 
 
 async def _notify_admin_buy_intent(bot, tg_user, course: Course):
-    """Fires the moment a user taps Buy — Professor sees interest immediately,
-    even before any payment proof is sent."""
     if tg_user.id == ADMIN_ID:
         return
     price_tag = f"₹{int(course.price)}" if course.price is not None else "TBD"
@@ -400,37 +409,58 @@ async def cb_send_gift_card(call: CallbackQuery, state: FSMContext):
     if not course:
         await call.answer("This course isn't available right now.", show_alert=True)
         return
+        
     await state.set_state(BuyFlow.waiting_for_gift_card)
-    await state.update_data(course_id=course_id, order_id=None, msg_count=0)
+    # Storing data for FSM limits and Promo tracking
+    await state.update_data(
+        course_id=course_id, 
+        order_id=None, 
+        msg_count=0, 
+        attempt=0, 
+        price=float(course.price) if course.price else 0
+    )
     await log_step(call.from_user.id, f"Started gift card submission for course_id={course_id}")
+    
+    # 🔔 Start Auto-Reminder for Cart Abandonment
+    asyncio.create_task(cart_abandonment_reminder(call.bot, call.from_user.id, course.name))
+
     price_tag = f"₹{int(course.price)}" if course.price is not None else "to be confirmed by Professor"
     await call.message.edit_text(
         f"🎁 <b>Sending payment for:</b> {course.name} (ID {course.id}) — {price_tag}\n\n"
-        "Send the Amazon Gift Card <b>photo</b>, the <b>14-digit alphanumeric code</b>, or any proof — "
-        "text, photo or document. You can send up to <b>3 messages</b> here (e.g. screenshot + code + anything else).\n\n"
+        "Send the Amazon Gift Card <b>photo</b>, the <b>14-digit alphanumeric code</b>, or any proof.\n"
+        "You can send up to <b>3 valid messages</b> here.\n\n"
+        "<i>Got a Promo Code? Type:</i> <code>/applypromo CODE</code>\n\n"
         "Everything goes straight to Professor for verification — the course unlocks in 'My Courses' the moment it's approved ✅",
         reply_markup=gift_card_collect_kb(),
     )
     await call.answer()
 
-
-@router.callback_query(F.data == "gcdone")
-async def cb_gift_card_done(call: CallbackQuery, state: FSMContext):
+@router.message(Command("applypromo"))
+async def cmd_apply_promo(message: Message, state: FSMContext):
+    """Dynamic Flash Sales - Applies a promo code to the current FSM session."""
     data = await state.get_data()
-    if not data.get("order_id"):
-        await call.answer("Send at least one message (photo/code) first.", show_alert=True)
-        return
-    await state.clear()
-    await call.message.edit_text(
-        "✅ Got it — everything's been sent to Professor for verification.\n"
-        "You'll get a notification once it's approved, and the course will appear under 'My Courses' 🎉",
-        reply_markup=main_menu_kb(),
-    )
-    await call.answer()
+    if not data or not data.get("price"): 
+        return await message.answer("⚠️ Promo codes can only be applied on the payment screen.")
+    
+    parts = message.text.split()
+    if len(parts) != 2: 
+        return await message.answer("Usage: /applypromo <CODE>")
+        
+    code = parts[1].upper()
+    if code in ACTIVE_PROMOS:
+        discount = ACTIVE_PROMOS[code]
+        new_price = data["price"] - (data["price"] * discount / 100)
+        await state.update_data(price=new_price)
+        await message.answer(
+            f"🎉 <b>Promo Applied!</b> You got {discount}% off.\n"
+            f"New price to pay: <b>₹{int(new_price)}</b>", 
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Invalid or Expired Promo Code.")
 
 
 MAX_GIFT_CARD_MESSAGES = 3
-
 
 @router.message(BuyFlow.waiting_for_gift_card, F.photo | F.text | F.document)
 async def receive_gift_card_proof(message: Message, state: FSMContext):
@@ -438,13 +468,38 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
     course_id = data["course_id"]
     order_id = data.get("order_id")
     msg_count = data.get("msg_count", 0)
+    attempt = data.get("attempt", 0) + 1
+    
+    # 🛡️ 4 MESSAGE PAYMENT VALIDATION LIMIT (Anti-Spam)
+    if attempt > 4:
+        await state.clear()
+        return await message.answer("❌ <b>Session Cancelled:</b> Aapne 4 invalid attempts kiye hain. Kripya menu se phir se course select karein.", parse_mode="HTML")
+        
+    await state.update_data(attempt=attempt)
+
+    code_text = ""
+    kind, content = "", ""
 
     if message.photo:
         kind, content = "photo", message.photo[-1].file_id
+        # Trigger AI OCR if photo is sent
+        scan_msg = await message.answer("🔍 <i>AI OCR is scanning your image...</i>", parse_mode="HTML")
+        code_text = await scan_image_for_code(message.bot, content)
+        await scan_msg.delete()
     elif message.document:
         kind, content = "document", message.document.file_id
     else:
         kind, content = "text", message.text
+        code_text = message.text
+
+    # Alphanumeric Validation for Amazon Pay
+    if kind == "text" and not re.match(r"^[A-Z0-9]{14}$", code_text.upper()):
+        await message.answer(f"⚠️ Invalid Format! Attempt ({attempt}/4).\nSahi 14-digit code ya clear photo bhejein.")
+        # Super Feature: Notify admin quietly about invalid attempts
+        try:
+            await message.bot.send_message(ADMIN_ID, f"⚠️ User {uid_tag(message.from_user.id)} provided invalid code format:\nInput: <code>{code_text}</code>", parse_mode="HTML")
+        except: pass
+        return
 
     async with async_session() as session:
         course = await session.get(Course, course_id)
@@ -460,7 +515,8 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
     await state.update_data(order_id=order_id, msg_count=msg_count)
     await log_step(message.from_user.id, f"Sent gift-card proof #{msg_count} for order #{order_id} ({course.name})")
 
-    price_tag = f"₹{int(course.price)}" if course.price is not None else "TBD — confirm with buyer before approving"
+    price_to_show = f"₹{int(data.get('price', course.price))}" if course.price is not None else "TBD"
+
     if msg_count == 1:
         admin_caption = (
             "🔔 <b>New Order — Verification Needed</b>\n\n"
@@ -470,9 +526,12 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
             f"🆔 User ID: {uid_tag(message.from_user.id)}\n"
             f"📘 Course: {course.name}\n"
             f"🆔 Course ID: {course.id}\n"
-            f"💰 Price: {price_tag}\n"
+            f"💰 Final Price: {price_to_show}\n"
             f"📎 Message 1/{MAX_GIFT_CARD_MESSAGES}"
         )
+        if code_text and kind != "document":
+            admin_caption += f"\n\n🤖 OCR/Code Result: <code>{code_text}</code>"
+
         kb = admin_order_decision_kb(order_id)
     else:
         admin_caption = (
@@ -483,12 +542,12 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
 
     try:
         if kind == "text":
-            admin_caption += f"\n🎁 Content:\n<code>{content}</code>"
-            await message.bot.send_message(ADMIN_ID, admin_caption, reply_markup=kb)
+            admin_caption += f"\n\n🎁 Content:\n<code>{content}</code>"
+            await message.bot.send_message(ADMIN_ID, admin_caption, reply_markup=kb, parse_mode="HTML")
         elif kind == "photo":
-            await message.bot.send_photo(ADMIN_ID, photo=content, caption=admin_caption, reply_markup=kb)
+            await message.bot.send_photo(ADMIN_ID, photo=content, caption=admin_caption, reply_markup=kb, parse_mode="HTML")
         else:
-            await message.bot.send_document(ADMIN_ID, document=content, caption=admin_caption, reply_markup=kb)
+            await message.bot.send_document(ADMIN_ID, document=content, caption=admin_caption, reply_markup=kb, parse_mode="HTML")
     except Exception:
         logger.exception("Failed to forward gift card proof to admin")
 
@@ -508,7 +567,22 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         )
 
 
-# ================= MINI APP -> BUY BRIDGE (fallback if sendData ever fires) =================
+@router.callback_query(F.data == "gcdone")
+async def cb_gift_card_done(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("order_id"):
+        await call.answer("Send at least one message (photo/code) first.", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text(
+        "✅ Got it — everything's been sent to Professor for verification.\n"
+        "You'll get a notification once it's approved, and the course will appear under 'My Courses' 🎉",
+        reply_markup=main_menu_kb(),
+    )
+    await call.answer()
+
+
+# ================= MINI APP -> BUY BRIDGE =================
 @router.message(F.web_app_data)
 async def handle_webapp_data(message: Message):
     try:
@@ -600,7 +674,7 @@ async def cb_faq(call: CallbackQuery):
     await call.answer()
 
 
-# ================= CONTACT PROFESSOR (in-bot, with reply routing) =================
+# ================= CONTACT PROFESSOR =================
 @router.callback_query(F.data == "contact:open")
 async def cb_contact_open(call: CallbackQuery, state: FSMContext):
     if call.from_user.id == ADMIN_ID:
@@ -657,17 +731,15 @@ async def receive_contact_message(message: Message, state: FSMContext):
     await message.answer("✅ Aapka message Professor ko bhej diya gaya hai. Jaldi hi reply milega.")
 
 
-# ================= ADMIN REPLY ROUTING (admin replies to a forwarded contact/order message) =================
+# ================= ADMIN REPLY ROUTING =================
 @router.message(F.reply_to_message, F.from_user.id == ADMIN_ID)
 async def admin_reply_to_user(message: Message):
-    """When Professor replies (Telegram 'Reply') to any forwarded user
-    message that contains a User ID, this routes the reply straight back to
-    that user — no extra commands needed."""
+    """When Professor replies to a forwarded user message."""
     import re
     source_text = message.reply_to_message.text or message.reply_to_message.caption or ""
     match = re.search(r"User ID:\s*(?:<code>)?(\d+)", source_text)
     if not match:
-        return  # not a message we tagged with a user id — let other handlers ignore it
+        return 
     target_user_id = int(match.group(1))
 
     async with async_session() as session:
@@ -696,7 +768,40 @@ async def cmd_my_id(message: Message):
     )
 
 
-# ================= FALLBACK (must be registered last in main.py) =================
+# ================= FALLBACK, AI REPLIES & BROADCAST LIMITS =================
 @router.message()
 async def fallback(message: Message):
+    user_id = message.from_user.id
+
+    # 1. Broadcast Direct Reply Cooling Limit
+    if message.reply_to_message and message.reply_to_message.from_user.id == message.bot.id:
+        broadcast_reply_counts[user_id] += 1
+        
+        # 5 message ka cooling period
+        if broadcast_reply_counts[user_id] > 5:
+            await message.answer("⚠️ Limit Reached! Please use /contact or go to the Help section to talk to the Professor.")
+            return
+            
+        # Forward direct reply to admin (Protects Privacy)
+        content = message.text or message.caption or "[Media]"
+        try:
+            await message.bot.send_message(
+                ADMIN_ID, 
+                f"📩 <b>Reply to Broadcast</b> from @{message.from_user.username or message.from_user.first_name} (ID: {uid_tag(user_id)}):\n\n{content}", 
+                parse_mode="HTML"
+            )
+            await message.answer("✅ Aapka message Professor ko bhej diya gaya hai.")
+        except Exception:
+            pass
+        return
+
+    # 2. AI Auto-Reply System (Only triggered if enabled by Admin)
+    if AI_STATE.get("enabled", False) and message.text:
+        txt = message.text.lower()
+        if "validity" in txt:
+            return await message.answer("🤖 <b>Auto-Reply:</b> Hamare sabhi courses ki validity Lifetime hai! ♾️", parse_mode="HTML")
+        if "discount" in txt or "price" in txt:
+            return await message.answer("🤖 <b>Auto-Reply:</b> Prices Mini-App mein latest updated hain. Agar koi promo code ho toh <b>/applypromo CODE</b> use karein.", parse_mode="HTML")
+
+    # Default Fallback Behavior (Same as original)
     await message.answer(f"{get_line()}\n\nUse the menu below to choose a section 👇", reply_markup=main_menu_kb())
