@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -7,14 +8,15 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent
+from aiogram.types import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat, ErrorEvent, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select
 
 from config import BOT_TOKEN, WEBAPP_BASE_URL, PORT, BOT_NAME, ADMIN_ID
-from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, async_session, Section, Course
+from database import init_db, seed_sections, seed_courses, migrate_v2, migrate_v3, async_session, Section, Course, ConnectedChat
 from keyboards import get_line
 from webapp_template import render_section_page
+from security import SecurityMiddleware
 import user_handlers
 import admin_handlers
 
@@ -24,6 +26,9 @@ logger = logging.getLogger(__name__)
 # aiogram 3.7+ requires parse_mode via DefaultBotProperties, not a direct kwarg.
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
+
+# 🛡️ ZERO-TRUST SECURITY FIREWALL ACTIVATION
+dp.message.middleware(SecurityMiddleware())
 
 # Fetched once at startup — used so the Mini App's "Buy Now" button can build
 # a https://t.me/<username>?start=buy_<id> deep link back into this exact bot.
@@ -70,6 +75,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="adminhelp", description="Full admin command list"),
     BotCommand(command="addcourse", description="Add course (guided)"),
     BotCommand(command="quickadd", description="Add course (one message)"),
+    BotCommand(command="addforall", description="Broadcast Ad to all groups (72h delete)"),
     BotCommand(command="grant", description="Manually unlock a course for a user"),
     BotCommand(command="price", description="Change a course's price"),
     BotCommand(command="removecourse", description="Hide a course"),
@@ -82,6 +88,35 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="stats", description="Bot stats"),
     BotCommand(command="broadcast", description="Message all users"),
 ]
+
+# ========================================================
+# ⚙️ 24-HOUR AUTO PROMOTION TASK (ZERO-COST MARKETING)
+# ========================================================
+async def daily_promotional_task(bot_instance: Bot):
+    while True:
+        await asyncio.sleep(24 * 3600)  # Runs every 24 Hours
+        try:
+            me = await bot_instance.get_me()
+            bot_url = f"https://t.me/{me.username}?start=start"
+            btn = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🤖 Message Official Bot", url=bot_url)]
+            ])
+            text = (
+                f"🎓 <b>Welcome to the Official {BOT_NAME} Community!</b>\n\n"
+                f"For premium courses, instant support, and exclusive study material, "
+                f"interact with our Official Bot below. 👇"
+            )
+            
+            async with async_session() as session:
+                result = await session.execute(select(ConnectedChat))
+                chats = result.scalars().all()
+                for chat in chats:
+                    try:
+                        await bot_instance.send_message(chat.id, text, reply_markup=btn, parse_mode="HTML")
+                    except Exception as e:
+                        logger.error(f"Failed to send 24h message to {chat.id}: {e}")
+        except Exception as e:
+            logger.error(f"Daily task loop error: {e}")
 
 
 @asynccontextmanager
@@ -117,6 +152,9 @@ async def lifespan(app: FastAPI):
             logger.exception(f"Failed to set webhook to '{webhook_url}' — check WEBAPP_BASE_URL")
     else:
         logger.warning("WEBAPP_BASE_URL not set and RAILWAY_PUBLIC_DOMAIN unavailable — webhook NOT configured yet.")
+
+    # Start the 24h background loop task automatically
+    asyncio.create_task(daily_promotional_task(bot))
 
     yield
 
