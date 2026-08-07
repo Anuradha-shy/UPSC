@@ -1,19 +1,6 @@
 """
 Database: models + engine/session + initial section-tree seed + full course
 catalog seed, all in one file.
-
-Relationships use lazy="selectin" so that accessing course.sections /
-section.courses inside an async session actually works. Without this,
-SQLAlchemy's default lazy-loading tries to run a *sync* query under the hood,
-which crashes with a MissingGreenlet error the moment the Mini App API
-endpoint touches section.courses.
-
-v2 NOTE: the home-screen structure was reorganised (UPSC / State PSC /
-Subject Specific / Prelims & Mains Course / Test Series / Optional / NET-JRF).
-`migrate_v2()` at the bottom performs this restructuring on top of an
-*existing* deployed database safely and idempotently — it never deletes a
-course or a section, it only creates new sections and re-parents/re-tags
-existing ones. Safe to leave in main.py's startup on every deploy.
 """
 from datetime import datetime
 from sqlalchemy import (
@@ -101,8 +88,6 @@ class UserCourse(Base):
 
 
 class UserActivity(Base):
-    """Lightweight step-tracker so Professor can see what each user has been
-    doing inside the bot (menu clicks, buy attempts, etc.) — see /activity."""
     __tablename__ = "user_activity"
 
     id = Column(Integer, primary_key=True)
@@ -112,8 +97,6 @@ class UserActivity(Base):
 
 
 class ContactMessage(Base):
-    """Every inbound 'Contact Professor' message + the admin's reply (if any),
-    so Professor can see the full contact history for a user (see /contacthistory)."""
     __tablename__ = "contact_messages"
 
     id = Column(Integer, primary_key=True)
@@ -134,8 +117,6 @@ async def init_db():
 
 
 async def log_step(user_id: int, step: str):
-    """Fire-and-forget style step logger — call from any handler. Never raises
-    (a logging failure should never break a user-facing flow)."""
     try:
         async with async_session() as session:
             session.add(UserActivity(user_id=user_id, step=step))
@@ -156,10 +137,6 @@ OPTIONAL_SUBJECTS = [
     "Geology", "Agriculture",
 ]
 
-# ---- v2 home-screen structure ----
-# Top level (home screen buttons, in this order):
-#   UPSC | State PSC | Subject Specific | Prelims & Mains Course |
-#   Test Series | UPSC Optional | NET/JRF | Combo Deals | Other Courses
 SECTION_TREE = {
     ("upsc", "UPSC", "🏛"): [
         ("upsc_foundation", "Foundation", "⌂"),
@@ -211,9 +188,6 @@ SECTION_TREE = {
 
 
 async def seed_sections():
-    """Creates the whole tree if the sections table is completely empty
-    (fresh DB). On an existing DB this is a no-op — migrate_v2() handles
-    bringing an older tree up to date instead."""
     async with async_session() as session:
         existing = (await session.execute(select(Section))).scalars().first()
         if existing:
@@ -228,9 +202,6 @@ async def seed_sections():
 
 
 async def seed_courses():
-    """One-time seed of the full course catalog (COURSE_SEED, defined in
-    course_seed_data.py). Runs only if the courses table is empty, so it is
-    safe to leave this call in main.py's startup every deploy."""
     async with async_session() as session:
         existing = (await session.execute(select(Course))).scalars().first()
         if existing:
@@ -238,7 +209,8 @@ async def seed_courses():
         result = await session.execute(select(Section))
         sections_by_key = {s.key: s for s in result.scalars().all()}
 
-        for name, faculty, medium, notes, price, section_keys in COURSE_SEED:
+        # 7 items unpack ho rahe hain
+        for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
             course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
             for key in section_keys:
                 sec = sections_by_key.get(key)
@@ -265,7 +237,6 @@ NEW_SUBJECT_CHILDREN = [
     ("subj_public_admin", "Public Administration", "🏢"),
 ]
 
-# (section_key_to_reparent, new_parent_key)
 REPARENT = [
     ("upsc_prelims", "prelims_mains"),
     ("upsc_mains", "prelims_mains"),
@@ -276,9 +247,6 @@ REPARENT = [
     ("upsc_subject_specific", "subject_specific"),
 ]
 
-# keyword -> extra section_key to *add* (additive tagging, never removes the
-# course from wherever it already was) — used to sort the old catch-all
-# "Subject Specific Course" pile into the new finer subject buckets.
 KEYWORD_SECTION_MAP = [
     (["mrunal", "economy", "economics", "pcb", "shivin", "jayant", "aditya kaliya",
       "basava", "rishi jain", "bookstawa"], "subj_economy"),
@@ -292,21 +260,16 @@ KEYWORD_SECTION_MAP = [
 ]
 
 EXPLICIT_NEW_COURSES = [
-    # (name, faculty, medium, notes, price, [section_keys])
     ("Polity & Governance — Jatin Gupta", "Jatin Gupta", "", "", None, ["subj_polity"]),
 ]
 
 
 async def migrate_v2():
-    """Idempotent — safe to call on every startup, on both a brand-new DB
-    (seed_sections/seed_courses already built the v2 tree so this is a
-    no-op) and an older deployed DB (brings it up to the v2 structure
-    without deleting or losing anything)."""
     async with async_session() as session:
         result = await session.execute(select(Section))
         sections = {s.key: s for s in result.scalars().all()}
         if not sections:
-            return  # DB not seeded yet — nothing to migrate
+            return  
 
         changed = False
 
@@ -340,8 +303,7 @@ async def migrate_v2():
         if changed:
             await session.commit()
 
-        # 4) additive reclassification of the old subject-specific catch-all
-        # pile into the finer subject buckets (keyword match on name+faculty)
+        # 4) additive reclassification 
         catchall = sections.get("upsc_subject_specific")
         if catchall:
             result = await session.execute(select(Course))
@@ -361,7 +323,7 @@ async def migrate_v2():
                             course.sections.append(target_sec)
             await session.commit()
 
-        # 5) add any explicit new named courses (e.g. Polity — Jatin Gupta)
+        # 5) add any explicit new named courses 
         result = await session.execute(select(Course.name))
         existing_names = {n for (n,) in result.all()}
         for name, faculty, medium, notes, price, section_keys in EXPLICIT_NEW_COURSES:
@@ -375,29 +337,62 @@ async def migrate_v2():
             session.add(course)
         await session.commit()
 
-        # 6) sync any COURSE_SEED entries that aren't in the DB yet by exact
-        # name (keeps an existing deployed bot's catalog current if the seed
-        # file is updated later — never touches an existing course's price).
-        result = await session.execute(select(Course.name))
-        existing_names = {n for (n,) in result.all()}
+        # 6) SAFE SYNC CATALOG: Update Prices, Hide Missing, Add New
+        result = await session.execute(select(Course))
+        db_courses = result.scalars().all()
+        
+        # Seed courses ka dictionary bana lo
+        seed_dict = {}
         for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
-            
-            if name in existing_names:
-                continue
-            course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
-            for key in section_keys:
+            seed_dict[name] = {
+                "faculty": faculty, "medium": medium, "notes": notes, 
+                "price": price, "section_keys": section_keys
+            }
+
+        courses_changed = False
+        
+        # Existing DB courses ko check karo
+        for course in db_courses:
+            if course.name in seed_dict:
+                # Nayi list me hai -> Details update karo aur active rakho
+                seed_data = seed_dict[course.name]
+                course.price = seed_data["price"]
+                course.faculty = seed_data["faculty"]
+                course.medium = seed_data["medium"]
+                course.notes = seed_data["notes"]
+                course.is_active = True
+                
+                # Dictionary se hata do taki sirf naye bache
+                del seed_dict[course.name]
+                courses_changed = True
+            else:
+                # Nayi list me NAHI hai -> Hide kar do (Delete nahi)
+                if course.is_active:
+                    course.is_active = False
+                    courses_changed = True
+
+        # Jo seed_dict me bach gaye, wo bilkul naye courses hain -> Unhe add karo
+        for name, seed_data in seed_dict.items():
+            new_course = Course(
+                name=name, 
+                faculty=seed_data["faculty"], 
+                medium=seed_data["medium"], 
+                notes=seed_data["notes"], 
+                price=seed_data["price"],
+                is_active=True
+            )
+            for key in seed_data["section_keys"]:
                 sec = sections.get(key)
                 if sec:
-                    course.sections.append(sec)
-            session.add(course)
-        await session.commit()
+                    new_course.sections.append(sec)
+            session.add(new_course)
+            courses_changed = True
+            
+        if courses_changed:
+            await session.commit()
 
 
 # ---------------- v3 migration: simplified home screen ----------------
-# Home screen now shows ONLY: UPSC | Prelims & Mains Specific Batch |
-# Subject Specific Batch | State PSC | Search | Contact Professor (+ My Courses).
-# UPSC Optional / Test Series move *inside* UPSC. NET-JRF, Combo Deals and
-# Other Courses fold into Subject Specific so nothing is ever orphaned.
 V3_REPARENT = [
     ("upsc_optional", "upsc"),
     ("upsc_ts_prelims", "upsc"),
@@ -407,9 +402,6 @@ V3_REPARENT = [
     ("other_misc", "subject_specific"),
 ]
 
-# additive tagging: fold CSAT / PYQ / Current Affairs into the new leaner
-# UPSC menu (Foundation) and Prelims&Mains menu — courses keep their
-# original section too, this only ADDS a second listing spot.
 V3_ADDITIVE_TAGS = [
     ("upsc_csat", "upsc_prelims"),
     ("upsc_pyq", "upsc_prelims"),
@@ -424,10 +416,6 @@ V3_RENAME = {
 
 
 async def migrate_v3():
-    """Idempotent — collapses the home screen to just: UPSC, Prelims & Mains
-    Specific Batch, Subject Specific Batch, State PSC (+ Search / Contact /
-    My Courses handled purely in keyboards.py, no DB section needed for
-    those). Never deletes a course — only re-parents/re-tags sections."""
     async with async_session() as session:
         result = await session.execute(select(Section))
         sections = {s.key: s for s in result.scalars().all()}
@@ -464,3 +452,4 @@ async def migrate_v3():
                 if target_key not in existing_keys:
                     course.sections.append(target_sec)
         await session.commit()
+    
