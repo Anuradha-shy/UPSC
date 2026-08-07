@@ -380,7 +380,8 @@ async def migrate_v2():
         # file is updated later — never touches an existing course's price).
         result = await session.execute(select(Course.name))
         existing_names = {n for (n,) in result.all()}
-        for name, faculty, medium, notes, price, section_keys in COURSE_SEED:
+        for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
+            
             if name in existing_names:
                 continue
             course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
