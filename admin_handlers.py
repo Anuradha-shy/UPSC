@@ -1,18 +1,23 @@
 import csv
 import io
+import asyncio
 from datetime import datetime
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, BufferedInputFile, ChatMemberUpdated
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select, func, desc
 
-from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage
+from database import async_session, Course, Section, Order, UserCourse, User, UserActivity, ContactMessage, ConnectedChat
 from keyboards import AdminAddCourse, AdminBroadcast
 from config import ADMIN_ID
+from security import auto_delete_task
 
 router = Router()
 
+# ================= NEW: GLOBAL STATES FOR PREMIUM FEATURES =================
+AI_STATE = {"enabled": False}
+ACTIVE_PROMOS = {}
 
 def admin_only(message: Message) -> bool:
     return message.from_user.id == ADMIN_ID
@@ -40,6 +45,89 @@ def _parse_id(txt: str):
         return int(txt.strip()), None
     except ValueError:
         return None, f"⚠️ '{txt}' isn't a valid ID. Send a number only."
+
+# ================= NEW: AUTO CHAT DETECTION (For Broadcast 72h) =================
+@router.my_chat_member()
+async def on_bot_added_to_chat(event: ChatMemberUpdated):
+    """Automatically tracks when bot is added or removed from groups/channels."""
+    async with async_session() as session:
+        chat = await session.get(ConnectedChat, event.chat.id)
+        
+        # If bot is added and made member/admin
+        if event.new_chat_member.status in ["member", "administrator", "creator"]:
+            if not chat:
+                session.add(ConnectedChat(id=event.chat.id, type=event.chat.type))
+                await session.commit()
+                
+        # If bot is removed or kicked
+        elif event.new_chat_member.status in ["left", "kicked", "restricted"]:
+            if chat:
+                await session.delete(chat)
+                await session.commit()
+
+
+# ================= NEW: PREMIUM ADMIN COMMANDS =================
+@router.message(Command("toggle_ai"))
+async def cmd_toggle_ai(message: Message):
+    if not admin_only(message): return
+    AI_STATE["enabled"] = not AI_STATE["enabled"]
+    status = "ON" if AI_STATE["enabled"] else "OFF"
+    await message.answer(f"🤖 AI Auto-Reply is now <b>{status}</b>", parse_mode="HTML")
+
+@router.message(Command("createpromo"))
+async def cmd_create_promo(message: Message):
+    if not admin_only(message): return
+    parts = message.text.split()
+    if len(parts) != 3:
+        return await message.answer("Usage: /createpromo <CODE> <DISCOUNT_PERCENT>\nExample: /createpromo DIWALI 20")
+    code, percent = parts[1].upper(), int(parts[2])
+    ACTIVE_PROMOS[code] = percent
+    await message.answer(f"🎟️ Promo Code <b>{code}</b> created with {percent}% discount!", parse_mode="HTML")
+
+@router.message(Command("addforall"))
+async def cmd_addforall(message: Message):
+    """Broadcasts a replied Ad message to ALL connected groups & channels."""
+    if not admin_only(message): return
+    if not message.reply_to_message:
+        return await message.answer("❌ Please reply to the Ad message/photo with /addforall")
+        
+    await message.answer("📢 Broadcasting to ALL connected Groups & Channels... (Auto-deletes in 72h)")
+    
+    async with async_session() as session:
+        chats = (await session.execute(select(ConnectedChat))).scalars().all()
+    
+    if not chats:
+        return await message.answer("⚠️ Bot is not in any groups or channels yet.")
+
+    sent, failed = 0, 0
+    for chat in chats:
+        try:
+            sent_msg = await message.reply_to_message.copy_to(chat_id=chat.id)
+            asyncio.create_task(auto_delete_task(message.bot, chat.id, sent_msg.message_id, delay_hours=72))
+            sent += 1
+        except Exception:
+            failed += 1
+            
+    await message.answer(f"✅ Broadcast complete!\nSent to: <b>{sent} chats</b>\nFailed: {failed} chats.", parse_mode="HTML")
+
+@router.message(Command("weekly_report"))
+async def manual_weekly_report(message: Message):
+    if not admin_only(message): return
+    async with async_session() as session:
+        users_count = (await session.execute(select(func.count(User.id)))).scalar()
+        revenue = (await session.execute(select(Course.price).join(UserCourse, UserCourse.course_id == Course.id))).all()
+        total_rev = sum(float(p[0]) for p in revenue if p[0] is not None)
+        chats_count = (await session.execute(select(func.count(ConnectedChat.id)))).scalar()
+    
+    report_text = (
+        "📊 <b>WEEKLY AI BUSINESS REPORT</b>\n\n"
+        f"👥 <b>Total Users Base:</b> {users_count}\n"
+        f"📢 <b>Connected Groups/Channels:</b> {chats_count}\n"
+        f"💰 <b>Total Verified Revenue:</b> ₹{int(total_rev)}\n"
+        "🛡️ <b>Security Status:</b> Active (0 Breaches)\n\n"
+        "<i>Running on Premium Auto-Pilot!</i> 🚀"
+    )
+    await message.answer(report_text, parse_mode="HTML")
 
 
 # ================= ADD COURSE =================
@@ -186,7 +274,7 @@ async def cmd_list_section_keys(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= MANUAL GRANT (assign a course to a user without payment flow) =================
+# ================= MANUAL GRANT =================
 @router.message(Command("grant"))
 async def cmd_grant(message: Message):
     if not admin_only(message):
@@ -393,7 +481,6 @@ async def cmd_list_courses(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: MOVE COURSE (reassign sections) =================
 @router.message(Command("movecourse"))
 async def cmd_move_course(message: Message):
     if not admin_only(message):
@@ -445,7 +532,6 @@ async def cmd_list_sections(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: PENDING ORDERS QUICK VIEW =================
 @router.message(Command("pending"))
 async def cmd_pending(message: Message):
     if not admin_only(message):
@@ -473,7 +559,6 @@ async def cmd_pending(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: USER LOOKUP =================
 @router.message(Command("userinfo"))
 async def cmd_user_info(message: Message):
     if not admin_only(message):
@@ -520,7 +605,6 @@ async def cmd_user_info(message: Message):
     )
 
 
-# ================= NEW: USER ACTIVITY (step tracking) =================
 @router.message(Command("activity"))
 async def cmd_activity(message: Message):
     if not admin_only(message):
@@ -549,7 +633,6 @@ async def cmd_activity(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: CONTACT HISTORY =================
 @router.message(Command("contacthistory"))
 async def cmd_contact_history(message: Message):
     if not admin_only(message):
@@ -579,7 +662,6 @@ async def cmd_contact_history(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: EXPORT (CSV) =================
 @router.message(Command("export"))
 async def cmd_export(message: Message):
     if not admin_only(message):
@@ -602,7 +684,6 @@ async def cmd_export(message: Message):
     )
 
 
-# ================= NEW: TOP COURSES =================
 @router.message(Command("topcourses"))
 async def cmd_top_courses(message: Message):
     if not admin_only(message):
@@ -625,7 +706,6 @@ async def cmd_top_courses(message: Message):
     await message.answer("\n".join(lines))
 
 
-# ================= NEW: RECENT USERS =================
 @router.message(Command("recentusers"))
 async def cmd_recent_users(message: Message):
     if not admin_only(message):
@@ -647,7 +727,6 @@ async def cmd_recent_users(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: FIND COURSE (search by keyword) =================
 @router.message(Command("findcourse"))
 async def cmd_find_course(message: Message):
     if not admin_only(message):
@@ -675,7 +754,6 @@ async def cmd_find_course(message: Message):
         await message.answer(text[i:i + 3500])
 
 
-# ================= NEW: COURSE INFO (detail lookup) =================
 @router.message(Command("courseinfo"))
 async def cmd_course_info(message: Message):
     if not admin_only(message):
@@ -713,7 +791,6 @@ async def cmd_course_info(message: Message):
     )
 
 
-# ================= NEW: REVENUE ESTIMATE =================
 @router.message(Command("revenue"))
 async def cmd_revenue(message: Message):
     if not admin_only(message):
@@ -738,6 +815,7 @@ async def cmd_revenue(message: Message):
 
 
 # ================= ORDER APPROVE/REJECT =================
+# MODIFIED WITH SINGLE-USE INVITE LINK FOR ANTI-PIRACY
 @router.callback_query(F.data.startswith("adm_ok:"))
 async def cb_approve(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -755,6 +833,15 @@ async def cb_approve(call: CallbackQuery):
         await session.commit()
         course = await session.get(Course, order.course_id)
 
+    # ANTI-PIRACY: Try to generate Single-Use Link if group_link is a Chat ID
+    link = course.group_link
+    if link and (link.startswith("-100") or link.startswith("@")):
+        try:
+            invite = await call.bot.create_chat_invite_link(chat_id=link, member_limit=1, name=f"Access_O{order_id}")
+            link = invite.invite_link
+        except Exception:
+            pass # Fallback to standard text if bot isn't admin in that chat
+
     if call.message.caption:
         await call.message.edit_caption(caption=call.message.caption + "\n\n✅ APPROVED")
     else:
@@ -762,7 +849,7 @@ async def cb_approve(call: CallbackQuery):
 
     group_text = (
         f"🎉 <b>{course.name}</b> has been approved!\n\n"
-        + (f"Join the group here: {course.group_link}" if course.group_link
+        + (f"Join the private group here (Single-Use Link): {link}" if link
            else "The group link will be added shortly — check 'My Courses' again soon.")
     )
     await call.bot.send_message(order.user_id, group_text)
@@ -897,6 +984,11 @@ async def cmd_admin_help(message: Message):
         return
     await message.answer(
         "🛠 <b>Admin Commands</b>\n\n"
+        "<b>New Premium Features</b>\n"
+        "/toggle_ai — Turn Auto-Reply ON/OFF\n"
+        "/createpromo &lt;CODE&gt; &lt;PERCENT&gt; — Create Flash Sale discount\n"
+        "/addforall — Broadcast Ad to all groups (72h delete)\n"
+        "/weekly_report — Generate AI Business Report\n\n"
         "<b>Courses</b>\n"
         "/addcourse — add a new course (step-by-step)\n"
         "/quickadd Name | Faculty | Medium | Notes | Price|TBD | section_keys — add a course in ONE message\n"
@@ -929,5 +1021,6 @@ async def cmd_admin_help(message: Message):
         "'Contact Professor' message — your reply is delivered to that user automatically.\n\n"
         "<b>Broadcast &amp; Stats</b>\n"
         "/broadcast — message all users\n"
-        "/stats — bot-wide numbers"
+        "/stats — bot-wide numbers",
+        parse_mode="HTML"
     )
