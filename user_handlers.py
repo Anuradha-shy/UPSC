@@ -2,6 +2,7 @@ import json
 import logging
 import asyncio
 import re
+import time
 from datetime import datetime
 from collections import defaultdict
 
@@ -32,19 +33,34 @@ from admin_handlers import AI_STATE, ACTIVE_PROMOS
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ================= ZERO-TRUST ANTI-TRACKING & PRIVACY ENFORCER =================
+def sanitize_telemetry_payload(text: str) -> str:
+    """Zero-Trust Shield: Strips out any potential IP telemetry, tracking parameters, or exposed endpoints."""
+    if not text:
+        return ""
+    # Scrub potential tracking URLs or IP leaking patterns
+    clean_text = re.sub(r"https?://[^\s]+", "[SECURE_LINK_MASKED]", text)
+    return clean_text
+
 # ================= GLOBAL TRACKERS =================
-# Cooling limit tracker for broadcast replies
 broadcast_reply_counts = defaultdict(int)
+ai_chat_monitor = defaultdict(list)   
+ai_frozen_until = {}                  
 
 def uid_tag(user_id: int) -> str:
-    """User ID wrapped so a single tap copies it in Telegram."""
+    """User ID wrapped so a single tap copies it in Telegram with zero telemetry footprint."""
     return f"<code>{user_id}</code>"
+
+
+def _with_ai_button(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    rows = list(kb.inline_keyboard) + [[InlineKeyboardButton(text="💬 Chat with Professor AI", callback_data="professor_ai:open")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ================= CART ABANDONMENT REMINDER TASK =================
 async def cart_abandonment_reminder(bot, user_id, course_name):
-    """Sends a reminder if user stops halfway through payment (4-hour delay)."""
-    await asyncio.sleep(4 * 3600) # Wait 4 hours
+    """Sends a secure reminder if user stops halfway through payment (4-hour delay)."""
+    await asyncio.sleep(4 * 3600) 
     try:
         await bot.send_message(
             user_id, 
@@ -58,7 +74,6 @@ async def cart_abandonment_reminder(bot, user_id, course_name):
 
 # ================= START / CHANNEL GATE =================
 async def _get_or_create_user(tg_user) -> tuple[User, bool]:
-    """Returns (user, is_new)."""
     async with async_session() as session:
         result = await session.execute(select(User).where(User.id == tg_user.id))
         user = result.scalar_one_or_none()
@@ -75,7 +90,6 @@ async def _get_or_create_user(tg_user) -> tuple[User, bool]:
 
 
 async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
-    """Sends the Professor a notification every time someone starts the bot."""
     if tg_user.id == ADMIN_ID:
         return
     status_tag = "🆕 New user" if is_new else "🔁 Returning user"
@@ -94,7 +108,6 @@ async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
 
 
 async def _is_member_of_backup_channel(bot, user_id: int) -> bool:
-    """Checks live membership via the Telegram API."""
     try:
         member = await bot.get_chat_member(chat_id=BACKUP_CHANNEL, user_id=user_id)
         return member.status in ("member", "administrator", "creator")
@@ -118,7 +131,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         await message.answer("🚫 You don't have access to this bot. Contact Professor if you have a query.")
         return
 
-    # Deep-link payload
     pending_course_id = None
     if command.args and command.args.startswith("buy_"):
         try:
@@ -151,7 +163,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     await message.answer(
         f"👋 {welcome}\n\n{get_line()}\n\n"
         "Choose a section below — each one opens the full catalog with faculty, notes and pricing.",
-        reply_markup=main_menu_kb(),
+        reply_markup=_with_ai_button(main_menu_kb()),
     )
 
 
@@ -181,7 +193,7 @@ async def cb_check_join(call: CallbackQuery, state: FSMContext):
     welcome = get_welcome_message(call.from_user.first_name)
     await call.message.edit_text(
         f"✅ Verified! {welcome}\n\n{get_line()}\n\nChoose a section below:",
-        reply_markup=main_menu_kb(),
+        reply_markup=_with_ai_button(main_menu_kb()),
     )
     await call.answer()
 
@@ -190,7 +202,21 @@ async def cb_check_join(call: CallbackQuery, state: FSMContext):
 async def cb_back_main(call: CallbackQuery):
     await call.message.edit_text(
         f"📚 <b>{BOT_NAME}</b>\n\n{get_line()}\n\nChoose a section:",
-        reply_markup=main_menu_kb(),
+        reply_markup=_with_ai_button(main_menu_kb()),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "professor_ai:open")
+async def cb_open_professor_ai(call: CallbackQuery):
+    await log_step(call.from_user.id, "Opened Chat with Professor AI")
+    await call.message.edit_text(
+        "🥼 <b>Professor AI</b>\n\n"
+        "Apna sawaal seedha type karke bhejo — courses, syllabus, strategy, kuch bhi.\n\n"
+        "⏱️ Fair-use limit: 10 messages / 5 minutes (bahut zyada load na ho, isliye).",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")]
+        ]),
     )
     await call.answer()
 
@@ -411,7 +437,6 @@ async def cb_send_gift_card(call: CallbackQuery, state: FSMContext):
         return
         
     await state.set_state(BuyFlow.waiting_for_gift_card)
-    # Storing data for FSM limits and Promo tracking
     await state.update_data(
         course_id=course_id, 
         order_id=None, 
@@ -421,7 +446,6 @@ async def cb_send_gift_card(call: CallbackQuery, state: FSMContext):
     )
     await log_step(call.from_user.id, f"Started gift card submission for course_id={course_id}")
     
-    # 🔔 Start Auto-Reminder for Cart Abandonment
     asyncio.create_task(cart_abandonment_reminder(call.bot, call.from_user.id, course.name))
 
     price_tag = f"₹{int(course.price)}" if course.price is not None else "to be confirmed by Professor"
@@ -437,7 +461,6 @@ async def cb_send_gift_card(call: CallbackQuery, state: FSMContext):
 
 @router.message(Command("applypromo"))
 async def cmd_apply_promo(message: Message, state: FSMContext):
-    """Dynamic Flash Sales - Applies a promo code to the current FSM session."""
     data = await state.get_data()
     if not data or not data.get("price"): 
         return await message.answer("⚠️ Promo codes can only be applied on the payment screen.")
@@ -463,7 +486,7 @@ async def cmd_apply_promo(message: Message, state: FSMContext):
 MAX_GIFT_CARD_MESSAGES = 3
 
 # ==============================================================================
-# 💳 WORLD-LEVEL PAYMENT & GIFT CARD PROOF HANDLER (MERGED & OPTIMIZED)
+# 💳 WORLD-LEVEL PAYMENT & GIFT CARD PROOF HANDLER (ANTI-TRACKING HARDENED)
 # ==============================================================================
 
 @router.message(BuyFlow.waiting_for_gift_card, F.photo | F.text | F.document)
@@ -474,7 +497,6 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
     msg_count = data.get("msg_count", 0)
     attempt = data.get("attempt", 0) + 1
     
-    # 🛡️ 4 MESSAGE PAYMENT VALIDATION LIMIT (Anti-Spam / Anti-Bruteforce)
     if attempt > 4:
         await state.clear()
         return await message.answer(
@@ -493,12 +515,11 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         kind, content = "photo", message.photo[-1].file_id
         scan_msg = await message.answer("🔍 <i>Professor AI: Inspecting payment proof & scanning details...</i>", parse_mode="HTML")
         
-        # 🌐 World-Level Universal Payment & OCR Inspector
         from security import inspect_payment_proof
-        scan_result = await inspect_payment_proof(message.bot, content)
+        expected_amt = data.get("price") or None  
+        scan_result = await inspect_payment_proof(message.bot, content, message.from_user.id, expected_amt)
         await scan_msg.delete()
         
-        # Rule 1: Auto-Reject fake, random or non-payment images (Without blocking user)
         if not scan_result["valid"] or scan_result["type"] == "INVALID":
             remaining_attempts = 4 - attempt
             await message.answer(
@@ -511,7 +532,7 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
             )
             return
 
-        payment_mode_tag = scan_result["type"] # 'GIFT_CARD' or 'UPI_PAYMENT'
+        payment_mode_tag = scan_result["type"] 
         code_text = scan_result.get("data", "")
 
     elif message.document:
@@ -522,7 +543,6 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         code_text = message.text
         payment_mode_tag = "TEXT_CODE"
         
-        # Alphanumeric Validation for Direct Text Amazon Pay Codes (14-digit format)
         if not re.match(r"^[A-Z0-9]{14}$", code_text.upper()):
             remaining_attempts = 4 - attempt
             await message.answer(
@@ -541,7 +561,6 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
                 pass
             return
 
-    # Database Order Creation / Association
     async with async_session() as session:
         course = await session.get(Course, course_id)
         if order_id is None:
@@ -563,7 +582,6 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
 
     price_to_show = f"₹{int(data.get('price', course.price))}" if course.price is not None else "TBD"
 
-    # Admin Notification Formatting with Payment Mode Badge
     mode_badge = "🎁 Amazon Pay Gift Card" if payment_mode_tag == "GIFT_CARD" else ("⚡ UPI Payment (₹10+ Extra Charge)" if payment_mode_tag == "UPI_PAYMENT" else "📄 Document/Text")
 
     if msg_count == 1:
@@ -580,7 +598,7 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
             f"📎 Message 1/{MAX_GIFT_CARD_MESSAGES}"
         )
         if code_text and kind != "document":
-            admin_caption += f"\n\n🤖 Extracted Data/Code: <code>{code_text}</code>"
+            admin_caption += f"\n\n🤖 Extracted Data/Code: <code>{sanitize_telemetry_payload(code_text)}</code>"
 
         kb = admin_order_decision_kb(order_id)
     else:
@@ -590,10 +608,9 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         )
         kb = None
 
-    # Forward Proof to Admin Safely
     try:
         if kind == "text":
-            admin_caption += f"\n\n🎁 Content:\n<code>{content}</code>"
+            admin_caption += f"\n\n🎁 Content:\n<code>{sanitize_telemetry_payload(content)}</code>"
             await message.bot.send_message(ADMIN_ID, admin_caption, reply_markup=kb, parse_mode="HTML")
         elif kind == "photo":
             await message.bot.send_photo(ADMIN_ID, photo=content, caption=admin_caption, reply_markup=kb, parse_mode="HTML")
@@ -602,7 +619,6 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
     except Exception:
         logger.exception("Failed to forward payment proof to admin")
 
-    # User Notification based on Payment Type
     if payment_mode_tag == "UPI_PAYMENT":
         await message.answer(
             "✅ <b>UPI Payment Received!</b>\n"
@@ -770,7 +786,7 @@ async def receive_contact_message(message: Message, state: FSMContext):
     tg_user = message.from_user
 
     async with async_session() as session:
-        session.add(ContactMessage(user_id=tg_user.id, direction="in", content=message.text or message.caption or "[media]"))
+        session.add(ContactMessage(user_id=tg_user.id, direction="in", content=sanitize_telemetry_payload(message.text or message.caption or "[media]")))
         await session.commit()
     await log_step(tg_user.id, "Sent a Contact Professor message")
 
@@ -783,9 +799,9 @@ async def receive_contact_message(message: Message, state: FSMContext):
     )
     try:
         if message.text:
-            await message.bot.send_message(ADMIN_ID, header + f"\n\n💬 {message.text}")
+            await message.bot.send_message(ADMIN_ID, header + f"\n\n💬 {sanitize_telemetry_payload(message.text)}")
         else:
-            await message.copy_to(chat_id=ADMIN_ID, caption=header + (f"\n\n💬 {message.caption}" if message.caption else ""))
+            await message.copy_to(chat_id=ADMIN_ID, caption=header + (f"\n\n💬 {sanitize_telemetry_payload(message.caption)}" if message.caption else ""))
     except Exception:
         logger.exception("Failed to forward contact message to admin")
 
@@ -795,8 +811,6 @@ async def receive_contact_message(message: Message, state: FSMContext):
 # ================= ADMIN REPLY ROUTING =================
 @router.message(F.reply_to_message, F.from_user.id == ADMIN_ID)
 async def admin_reply_to_user(message: Message):
-    """When Professor replies to a forwarded user message."""
-    import re
     source_text = message.reply_to_message.text or message.reply_to_message.caption or ""
     match = re.search(r"User ID:\s*(?:<code>)?(\d+)", source_text)
     if not match:
@@ -804,7 +818,7 @@ async def admin_reply_to_user(message: Message):
     target_user_id = int(match.group(1))
 
     async with async_session() as session:
-        session.add(ContactMessage(user_id=target_user_id, direction="out", content=message.text or message.caption or "[media]"))
+        session.add(ContactMessage(user_id=target_user_id, direction="out", content=sanitize_telemetry_payload(message.text or message.caption or "[media]")))
         await session.commit()
 
     try:
@@ -830,30 +844,39 @@ async def cmd_my_id(message: Message):
 
 
 # ==============================================================================
-# 🥼 PROFESSOR AI — ULTIMATE REAL-TIME DYNAMIC HUMAN-LIKE ENGINE (FULL VERSION)
+# 🥼 PROFESSOR AI — Real Gemini-powered Q&A, grounded in the live course catalog
 # ==============================================================================
+from security import professor_ai_reply, search_courses_by_query
 
-import logging
+AI_RATE_LIMIT_MSGS = 10
+AI_RATE_LIMIT_WINDOW_SEC = 5 * 60     
+AI_FREEZE_DURATION_SEC = 20 * 60      
 
-logger = logging.getLogger(__name__)
 
-def _detect_user_tone_and_prefix(user_text: str) -> str:
-    """Detects user vibe (bhai, sir, joking) and returns a human-like conversational prefix."""
-    txt = user_text.lower()
-    if any(w in txt for w in ["bhai", "bro", "yaar", "re", "dost"]):
-        return "Arre bhai, "
-    elif any(w in txt for w in ["sir", "mam", "madam", "ma'am"]):
-        return "Arre sir/madam, itna formal mat ho, umar mein chote hain aapke dost/bhai jaise hi maano! "
-    elif any(w in txt for w in ["haha", "lol", "rofl", "mazak", "mjak", "prank"]):
-        return "Haha, sahi hai! "
-    return "Sunno bhai, "
+def _check_ai_rate_limit(user_id: int) -> tuple[bool, int]:
+    now = time.time()
+
+    frozen_until = ai_frozen_until.get(user_id)
+    if frozen_until and now < frozen_until:
+        return False, max(1, int((frozen_until - now) / 60))
+    if frozen_until and now >= frozen_until:
+        del ai_frozen_until[user_id]
+        ai_chat_monitor[user_id] = []
+
+    ai_chat_monitor[user_id] = [t for t in ai_chat_monitor[user_id] if now - t < AI_RATE_LIMIT_WINDOW_SEC]
+    if len(ai_chat_monitor[user_id]) >= AI_RATE_LIMIT_MSGS:
+        ai_frozen_until[user_id] = now + AI_FREEZE_DURATION_SEC
+        return False, AI_FREEZE_DURATION_SEC // 60
+
+    ai_chat_monitor[user_id].append(now)
+    return True, 0
+
 
 @router.message()
 async def fallback(message: Message):
     user_id = message.from_user.id
     user_text = message.text or message.caption or ""
 
-    # 1. Broadcast / Payment Direct Reply Handling (Cooling Limit 5 msgs)
     if message.reply_to_message and message.reply_to_message.from_user.id == message.bot.id:
         broadcast_reply_counts[user_id] += 1
         
@@ -861,7 +884,7 @@ async def fallback(message: Message):
             await message.answer("⚠️ Limit reach ho gayi hai! Kripya /contact command use karein ya Help section se Professor se seedha baat karein.")
             return
             
-        content = user_text or "[Media]"
+        content = sanitize_telemetry_payload(user_text) or "[Media]"
         try:
             await message.bot.send_message(
                 ADMIN_ID, 
@@ -875,98 +898,54 @@ async def fallback(message: Message):
             logger.exception("Failed to deliver broadcast reply to admin")
         return
 
-    # 2. PROFESSOR AI 🥼 (Zero Limit, Real-Time Universal Dynamic Engine, Activated via /toggle_ai)
     if AI_STATE.get("enabled", False) and user_text:
-        txt_lower = user_text.lower()
-        tone_prefix = _detect_user_tone_and_prefix(user_text)
-        
-        ai_reply = ""
-        inline_kb = None
+        allowed, minutes = _check_ai_rate_limit(user_id)
+        if not allowed:
+            await message.answer(
+                f"⏱️ <b>Professor AI thodi der ke liye rest kar raha hai.</b>\n\n"
+                f"Aapne 5 minutes mein {AI_RATE_LIMIT_MSGS} messages ki limit cross kar li hai — "
+                f"~{minutes} minutes baad phir se try karein, ya /contact se seedha Professor ko likhein.",
+                parse_mode="HTML",
+            )
+            return
 
         try:
-            # Fetch all active courses dynamically from database
             async with async_session() as session:
                 result = await session.execute(select(Course).where(Course.is_active == True))
                 courses = result.scalars().all()
+            all_courses = [(c.name, c.faculty, c.medium, c.price, [s.key for s in c.sections]) for c in courses]
 
-            # A. Low Price / Budget Course Filter Handler
-            if any(w in txt_lower for w in ["sasta", "kam price", "cheap", "affordable", "low price", "budget", "kam dam", "kam fees"]):
-                sorted_courses = sorted([c for c in courses if c.price is not None], key=lambda x: float(x.price))
-                top_cheap = sorted_courses[:5]  # Limit to top 5 cheapest options
-                
-                if top_cheap:
-                    ai_reply = f"{tone_prefix}yeh lo sabse best aur pocket-friendly courses ki list (sabhi par Lifetime Validity milti hai):\n\n"
-                    kb_rows = []
-                    for c in top_cheap:
-                        price_tag = f"₹{int(c.price)}"
-                        ai_reply += f"• <b>{c.name}</b> — {price_tag}\n"
-                        kb_rows.append([InlineKeyboardButton(text=f"🛒 {c.name[:25]} ({price_tag})", callback_data=f"buy:{c.id}")])
-                    kb_rows.append([InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")])
-                    inline_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-                else:
-                    ai_reply = f"{tone_prefix}abhi sabhi courses ki pricing update ho rahi hai. Aap /contact karke Professor se direct baat kar lo!"
-                    inline_kb = main_menu_kb()
+            ai_reply = await professor_ai_reply(
+                user_text, all_courses, user_context=f"telegram_user_id={user_id}"
+            )
 
-            # B. Terminology / Syllabus / Google-Style Concept Definition Handler
-            elif any(w in txt_lower for w in ["kya hai", "what is", "meaning", "define", "terminology", "syllabus", "gs-", "prelims", "mains", "strategy", "roadmap"]):
-                term_found = user_text.replace("kya hai", "").replace("what is", "").replace("define", "").strip()
-                ai_reply = (
-                    f"{tone_prefix}dekho, <b>{term_found if len(term_found) > 3 else 'yeh topic'}</b> exam ke point of view se kaafi important concept hai. "
-                    f"Isme core fundamentals aur deep conceptual clarity honi zaroori hai.\n\n"
-                    f"Hamare structured courses mein isko zero se lekar advanced level tak detail mein cover karwaya gaya hai, "
-                    f"jisse exam mein direct questions solve ho sakein. Waqt mat gawayo, apna batch select karo aur prep strong karo! 🚀"
-                )
-                inline_kb = main_menu_kb()
-
-            # C. UNIVERSAL SMART SEARCH (Matches ANY course name, faculty, or keyword dynamically)
-            else:
-                matched_courses = []
-                query_tokens = [w for w in txt_lower.split() if len(w) > 1]  # Extract meaningful tokens
-                
-                for c in courses:
-                    c_name = c.name.lower()
-                    c_faculty = (c.faculty or "").lower()
-                    # Check if any query token matches course name or faculty name
-                    if any(token in c_name or token in c_faculty for token in query_tokens):
-                        matched_courses.append(c)
-
-                if matched_courses:
-                    # STRICT RULE: Maximum 10 courses in a single chat message
-                    capped_courses = matched_courses[:10]
-                    
-                    ai_reply = f"{tone_prefix}aapki requirement ke hisaab se yeh active courses available hain:\n\n"
-                    kb_rows = []
-                    for c in capped_courses:
-                        price_tag = f"₹{int(c.price)}" if c.price is not None else "Price TBD"
-                        ai_reply += f"📘 <b>{c.name}</b>\n   👨‍🏫 {c.faculty or 'Top Faculty'} | 💰 {price_tag} (Lifetime Validity)\n\n"
-                        kb_rows.append([InlineKeyboardButton(text=f"🛒 Buy: {c.name[:25]}...", callback_data=f"buy:{c.id}")])
-                    
-                    kb_rows.append([InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")])
-                    inline_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-                else:
-                    # D. COURSE NOT FOUND FALLBACK -> Direct Professor Contact Suggestion
-                    ai_reply = (
-                        f"{tone_prefix}yeh specific course ya material abhi hamare automated catalog mein match nahi hua. "
-                        f"Aapki kisi bhi custom demand ya extra requirement ke liye **seedha Professor se baat kar lo**, wo aapko arrange karke de denge! 👇"
-                    )
-                    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="💬 Talk to Professor Directly", callback_data="contact:open")],
-                        [InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")]
-                    ])
+            matched = search_courses_by_query(user_text, all_courses, max_results=5)
+            kb_rows = []
+            if matched:
+                name_to_course = {c.name: c for c in courses}
+                for name, faculty, medium, price, _sections in matched:
+                    course_obj = name_to_course.get(name)
+                    if not course_obj:
+                        continue
+                    price_tag = f"₹{int(price)}" if price is not None else "Price TBD"
+                    kb_rows.append([InlineKeyboardButton(text=f"🛒 {name[:28]} ({price_tag})", callback_data=f"buy:{course_obj.id}")])
+            if not matched:
+                kb_rows.append([InlineKeyboardButton(text="💬 Talk to Professor Directly", callback_data="contact:open")])
+            kb_rows.append([InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")])
+            inline_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
         except Exception as err:
             logger.exception(f"Professor AI Engine Error: {err}")
-            ai_reply = f"{tone_prefix}kuch technical glitch aa gaya hai system mein. Aap /contact use karke seedha Professor se baat kar lo!"
+            ai_reply = "⚠️ Kuch technical glitch aa gaya hai system mein. Aap /contact use karke seedha Professor se baat kar lo!"
             inline_kb = main_menu_kb()
 
-        # 🛡️ SECURE ADMIN LOGGING (Masks admin identity, sends transparent live logs)
         try:
             await message.bot.send_message(
                 ADMIN_ID,
                 f"🤖 <b>Professor AI 🥼 Live Log</b>\n"
                 f"👤 User ID: {uid_tag(user_id)}\n"
-                f"💬 Query: <i>{user_text}</i>\n"
-                f"📤 Response Sent: <i>{ai_reply[:140]}...</i>",
+                f"💬 Query: <i>{user_text[:200]}</i>\n"
+                f"📤 Response: <i>{ai_reply[:140]}...</i>",
                 parse_mode="HTML"
             )
         except Exception:
@@ -974,6 +953,4 @@ async def fallback(message: Message):
 
         return await message.answer(ai_reply, parse_mode="HTML", reply_markup=inline_kb)
 
-    # Default Fallback (When AI is OFF)
-    await message.answer(f"{get_line()}\n\nUse the menu below to choose a section 👇", reply_markup=main_menu_kb())
-    
+    await message.answer(f"{get_line()}\n\nUse the menu below to choose a section 👇", reply_markup=_with_ai_button(main_menu_kb()))
