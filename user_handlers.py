@@ -50,21 +50,23 @@ async def _get_or_create_user(tg_user) -> tuple[User, bool]:
 
 
 async def _notify_admin_of_start(bot, tg_user, is_new: bool, user: User):
-    """Notifies Professor only on a user's very first /start — not on repeat visits."""
-    if not is_new or tg_user.id == ADMIN_ID:
+    """Sends the Professor a notification every time someone starts the bot,
+    so admin always knows who's using it — including on repeat visits."""
+    if tg_user.id == ADMIN_ID:
         return
+    status_tag = "🆕 New user" if is_new else "🔁 Returning user"
     text = (
-        f"🆕 <b>New user started the bot</b>\n\n"
+        f"👋 <b>{status_tag} started the bot</b>\n\n"
         f"👤 Name: {tg_user.full_name}\n"
         f"🔗 Username: @{tg_user.username or '—'}\n"
         f"🆔 User ID: {uid_tag(tg_user.id)}\n"
-        f"🌐 Language: {tg_user.language_code or '—'}\n"
-        f"📅 First seen: {user.joined_at.strftime('%d %b %Y, %H:%M UTC') if user.joined_at else '—'}"
+        f"📅 First seen: {user.joined_at.strftime('%d %b %Y, %H:%M UTC') if user.joined_at else '—'}\n"
+        f"✅ Backup channel verified: {'Yes' if user.has_joined_backup_channel else 'No'}"
     )
     try:
         await bot.send_message(ADMIN_ID, text)
     except Exception:
-        logger.exception("Failed to notify admin of new user")
+        logger.exception("Failed to notify admin of /start")
 
 
 async def _is_member_of_backup_channel(bot, user_id: int) -> bool:
@@ -89,7 +91,7 @@ async def _is_member_of_backup_channel(bot, user_id: int) -> bool:
         return False
 
 
-@router.message(CommandStart())
+@router.message(CommandStart(deep_link=True))
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     user, is_new = await _get_or_create_user(message.from_user)
     await _notify_admin_of_start(message.bot, message.from_user, is_new, user)
