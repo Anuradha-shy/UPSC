@@ -768,40 +768,151 @@ async def cmd_my_id(message: Message):
     )
 
 
-# ================= FALLBACK, AI REPLIES & BROADCAST LIMITS =================
+# ==============================================================================
+# 🥼 PROFESSOR AI — ULTIMATE REAL-TIME DYNAMIC HUMAN-LIKE ENGINE (FULL VERSION)
+# ==============================================================================
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+def _detect_user_tone_and_prefix(user_text: str) -> str:
+    """Detects user vibe (bhai, sir, joking) and returns a human-like conversational prefix."""
+    txt = user_text.lower()
+    if any(w in txt for w in ["bhai", "bro", "yaar", "re", "dost"]):
+        return "Arre bhai, "
+    elif any(w in txt for w in ["sir", "mam", "madam", "ma'am"]):
+        return "Arre sir/madam, itna formal mat ho, umar mein chote hain aapke dost/bhai jaise hi maano! "
+    elif any(w in txt for w in ["haha", "lol", "rofl", "mazak", "mjak", "prank"]):
+        return "Haha, sahi hai! "
+    return "Sunno bhai, "
+
 @router.message()
 async def fallback(message: Message):
     user_id = message.from_user.id
+    user_text = message.text or message.caption or ""
 
-    # 1. Broadcast Direct Reply Cooling Limit
+    # 1. Broadcast / Payment Direct Reply Handling (Cooling Limit 5 msgs)
     if message.reply_to_message and message.reply_to_message.from_user.id == message.bot.id:
         broadcast_reply_counts[user_id] += 1
         
-        # 5 message ka cooling period
         if broadcast_reply_counts[user_id] > 5:
-            await message.answer("⚠️ Limit Reached! Please use /contact or go to the Help section to talk to the Professor.")
+            await message.answer("⚠️ Limit reach ho gayi hai! Kripya /contact command use karein ya Help section se Professor se seedha baat karein.")
             return
             
-        # Forward direct reply to admin (Protects Privacy)
-        content = message.text or message.caption or "[Media]"
+        content = user_text or "[Media]"
         try:
             await message.bot.send_message(
                 ADMIN_ID, 
-                f"📩 <b>Reply to Broadcast</b> from @{message.from_user.username or message.from_user.first_name} (ID: {uid_tag(user_id)}):\n\n{content}", 
+                f"📩 <b>User Reply Received (Broadcast/Payment)</b>\n"
+                f"👤 From User ID: {uid_tag(user_id)}\n\n"
+                f"💬 Message Content:\n<code>{content}</code>", 
                 parse_mode="HTML"
             )
-            await message.answer("✅ Aapka message Professor ko bhej diya gaya hai.")
+            await message.answer("✅ Aapka message Professor ko bhej diya gaya hai. Jaldi hi reply milega.")
         except Exception:
-            pass
+            logger.exception("Failed to deliver broadcast reply to admin")
         return
 
-    # 2. AI Auto-Reply System (Only triggered if enabled by Admin)
-    if AI_STATE.get("enabled", False) and message.text:
-        txt = message.text.lower()
-        if "validity" in txt:
-            return await message.answer("🤖 <b>Auto-Reply:</b> Hamare sabhi courses ki validity Lifetime hai! ♾️", parse_mode="HTML")
-        if "discount" in txt or "price" in txt:
-            return await message.answer("🤖 <b>Auto-Reply:</b> Prices Mini-App mein latest updated hain. Agar koi promo code ho toh <b>/applypromo CODE</b> use karein.", parse_mode="HTML")
+    # 2. PROFESSOR AI 🥼 (Zero Limit, Real-Time Universal Dynamic Engine, Activated via /toggle_ai)
+    if AI_STATE.get("enabled", False) and user_text:
+        txt_lower = user_text.lower()
+        tone_prefix = _detect_user_tone_and_prefix(user_text)
+        
+        ai_reply = ""
+        inline_kb = None
 
-    # Default Fallback Behavior (Same as original)
+        try:
+            # Fetch all active courses dynamically from database
+            async with async_session() as session:
+                result = await session.execute(select(Course).where(Course.is_active == True))
+                courses = result.scalars().all()
+
+            # A. Low Price / Budget Course Filter Handler
+            if any(w in txt_lower for w in ["sasta", "kam price", "cheap", "affordable", "low price", "budget", "kam dam", "kam fees"]):
+                sorted_courses = sorted([c for c in courses if c.price is not None], key=lambda x: float(x.price))
+                top_cheap = sorted_courses[:5]  # Limit to top 5 cheapest options
+                
+                if top_cheap:
+                    ai_reply = f"{tone_prefix}yeh lo sabse best aur pocket-friendly courses ki list (sabhi par Lifetime Validity milti hai):\n\n"
+                    kb_rows = []
+                    for c in top_cheap:
+                        price_tag = f"₹{int(c.price)}"
+                        ai_reply += f"• <b>{c.name}</b> — {price_tag}\n"
+                        kb_rows.append([InlineKeyboardButton(text=f"🛒 {c.name[:25]} ({price_tag})", callback_data=f"buy:{c.id}")])
+                    kb_rows.append([InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")])
+                    inline_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+                else:
+                    ai_reply = f"{tone_prefix}abhi sabhi courses ki pricing update ho rahi hai. Aap /contact karke Professor se direct baat kar lo!"
+                    inline_kb = main_menu_kb()
+
+            # B. Terminology / Syllabus / Google-Style Concept Definition Handler
+            elif any(w in txt_lower for w in ["kya hai", "what is", "meaning", "define", "terminology", "syllabus", "gs-", "prelims", "mains", "strategy", "roadmap"]):
+                term_found = user_text.replace("kya hai", "").replace("what is", "").replace("define", "").strip()
+                ai_reply = (
+                    f"{tone_prefix}dekho, <b>{term_found if len(term_found) > 3 else 'yeh topic'}</b> exam ke point of view se kaafi important concept hai. "
+                    f"Isme core fundamentals aur deep conceptual clarity honi zaroori hai.\n\n"
+                    f"Hamare structured courses mein isko zero se lekar advanced level tak detail mein cover karwaya gaya hai, "
+                    f"jisse exam mein direct questions solve ho sakein. Waqt mat gawayo, apna batch select karo aur prep strong karo! 🚀"
+                )
+                inline_kb = main_menu_kb()
+
+            # C. UNIVERSAL SMART SEARCH (Matches ANY course name, faculty, or keyword dynamically)
+            else:
+                matched_courses = []
+                query_tokens = [w for w in txt_lower.split() if len(w) > 1]  # Extract meaningful tokens
+                
+                for c in courses:
+                    c_name = c.name.lower()
+                    c_faculty = (c.faculty or "").lower()
+                    # Check if any query token matches course name or faculty name
+                    if any(token in c_name or token in c_faculty for token in query_tokens):
+                        matched_courses.append(c)
+
+                if matched_courses:
+                    # STRICT RULE: Maximum 10 courses in a single chat message
+                    capped_courses = matched_courses[:10]
+                    
+                    ai_reply = f"{tone_prefix}aapki requirement ke hisaab se yeh active courses available hain:\n\n"
+                    kb_rows = []
+                    for c in capped_courses:
+                        price_tag = f"₹{int(c.price)}" if c.price is not None else "Price TBD"
+                        ai_reply += f"📘 <b>{c.name}</b>\n   👨‍🏫 {c.faculty or 'Top Faculty'} | 💰 {price_tag} (Lifetime Validity)\n\n"
+                        kb_rows.append([InlineKeyboardButton(text=f"🛒 Buy: {c.name[:25]}...", callback_data=f"buy:{c.id}")])
+                    
+                    kb_rows.append([InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")])
+                    inline_kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+                else:
+                    # D. COURSE NOT FOUND FALLBACK -> Direct Professor Contact Suggestion
+                    ai_reply = (
+                        f"{tone_prefix}yeh specific course ya material abhi hamare automated catalog mein match nahi hua. "
+                        f"Aapki kisi bhi custom demand ya extra requirement ke liye **seedha Professor se baat kar lo**, wo aapko arrange karke de denge! 👇"
+                    )
+                    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="💬 Talk to Professor Directly", callback_data="contact:open")],
+                        [InlineKeyboardButton(text="⬅ Back to Menu", callback_data="menu:main")]
+                    ])
+
+        except Exception as err:
+            logger.exception(f"Professor AI Engine Error: {err}")
+            ai_reply = f"{tone_prefix}kuch technical glitch aa gaya hai system mein. Aap /contact use karke seedha Professor se baat kar lo!"
+            inline_kb = main_menu_kb()
+
+        # 🛡️ SECURE ADMIN LOGGING (Masks admin identity, sends transparent live logs)
+        try:
+            await message.bot.send_message(
+                ADMIN_ID,
+                f"🤖 <b>Professor AI 🥼 Live Log</b>\n"
+                f"👤 User ID: {uid_tag(user_id)}\n"
+                f"💬 Query: <i>{user_text}</i>\n"
+                f"📤 Response Sent: <i>{ai_reply[:140]}...</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        return await message.answer(ai_reply, parse_mode="HTML", reply_markup=inline_kb)
+
+    # Default Fallback (When AI is OFF)
     await message.answer(f"{get_line()}\n\nUse the menu below to choose a section 👇", reply_markup=main_menu_kb())
+    
