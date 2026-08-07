@@ -106,6 +106,14 @@ class ContactMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ConnectedChat(Base):
+    __tablename__ = "connected_chats"
+
+    id = Column(BigInteger, primary_key=True)
+    type = Column(String(50)) # 'group', 'supergroup', or 'channel'
+    added_at = Column(DateTime, default=datetime.utcnow)
+
+
 # ---------------- engine / session ----------------
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
@@ -209,7 +217,6 @@ async def seed_courses():
         result = await session.execute(select(Section))
         sections_by_key = {s.key: s for s in result.scalars().all()}
 
-        # 7 items unpack ho rahe hain
         for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
             course = Course(name=name, faculty=faculty, medium=medium, notes=notes, price=price)
             for key in section_keys:
@@ -273,7 +280,6 @@ async def migrate_v2():
 
         changed = False
 
-        # 1) ensure new top-level sections exist
         for key, name, emoji in NEW_TOP_SECTIONS:
             if key not in sections:
                 sec = Section(key=key, name=name, emoji=emoji, parent_id=None)
@@ -282,7 +288,6 @@ async def migrate_v2():
                 sections[key] = sec
                 changed = True
 
-        # 2) ensure new subject-child sections exist
         for key, name, emoji in NEW_SUBJECT_CHILDREN:
             if key not in sections:
                 parent = sections["subject_specific"]
@@ -292,7 +297,6 @@ async def migrate_v2():
                 sections[key] = sec
                 changed = True
 
-        # 3) reparent old sections onto the new top-level buckets
         for child_key, new_parent_key in REPARENT:
             child = sections.get(child_key)
             parent = sections.get(new_parent_key)
@@ -303,7 +307,6 @@ async def migrate_v2():
         if changed:
             await session.commit()
 
-        # 4) additive reclassification 
         catchall = sections.get("upsc_subject_specific")
         if catchall:
             result = await session.execute(select(Course))
@@ -323,7 +326,6 @@ async def migrate_v2():
                             course.sections.append(target_sec)
             await session.commit()
 
-        # 5) add any explicit new named courses 
         result = await session.execute(select(Course.name))
         existing_names = {n for (n,) in result.all()}
         for name, faculty, medium, notes, price, section_keys in EXPLICIT_NEW_COURSES:
@@ -337,11 +339,9 @@ async def migrate_v2():
             session.add(course)
         await session.commit()
 
-        # 6) SAFE SYNC CATALOG: Update Prices, Hide Missing, Add New
         result = await session.execute(select(Course))
         db_courses = result.scalars().all()
         
-        # Seed courses ka dictionary bana lo
         seed_dict = {}
         for name, faculty, medium, notes, price, section_keys, batch_id in COURSE_SEED:
             seed_dict[name] = {
@@ -351,27 +351,21 @@ async def migrate_v2():
 
         courses_changed = False
         
-        # Existing DB courses ko check karo
         for course in db_courses:
             if course.name in seed_dict:
-                # Nayi list me hai -> Details update karo aur active rakho
                 seed_data = seed_dict[course.name]
                 course.price = seed_data["price"]
                 course.faculty = seed_data["faculty"]
                 course.medium = seed_data["medium"]
                 course.notes = seed_data["notes"]
                 course.is_active = True
-                
-                # Dictionary se hata do taki sirf naye bache
                 del seed_dict[course.name]
                 courses_changed = True
             else:
-                # Nayi list me NAHI hai -> Hide kar do (Delete nahi)
                 if course.is_active:
                     course.is_active = False
                     courses_changed = True
 
-        # Jo seed_dict me bach gaye, wo bilkul naye courses hain -> Unhe add karo
         for name, seed_data in seed_dict.items():
             new_course = Course(
                 name=name, 
@@ -452,4 +446,3 @@ async def migrate_v3():
                 if target_key not in existing_keys:
                     course.sections.append(target_sec)
         await session.commit()
-    
