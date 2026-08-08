@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7209486623"))
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-BACKUP_CHANNEL = os.environ.get("BACKUP_CHANNEL", "@upscse27")
+BACKUP_CHANNEL = os.environ.get("BACKUP_CHANNEL", "https://t.me/upscse27")
 HELP_BOT_USERNAME = os.environ.get("HELP_BOT_USERNAME", "@csewala_bot")
 PROFESSOR_CONTACT_LINK = os.environ.get("PROFESSOR_CONTACT_LINK", "https://t.me/csevala")
 PAYMENT_HELP_LINK = os.environ.get("PAYMENT_HELP_LINK", "https://t.me/paymentformenti")
