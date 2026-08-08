@@ -573,7 +573,7 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         payment_mode_tag = scan_result["type"] 
         code_text = scan_result.get("data", "")
 
-        elif message.document:
+    elif message.document:
         kind, content = "document", message.document.file_id
         payment_mode_tag = "DOCUMENT_VOUCHER"
     else:
