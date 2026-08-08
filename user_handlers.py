@@ -573,7 +573,7 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         payment_mode_tag = scan_result["type"] 
         code_text = scan_result.get("data", "")
 
-    elif message.document:
+        elif message.document:
         kind, content = "document", message.document.file_id
         payment_mode_tag = "DOCUMENT_VOUCHER"
     else:
@@ -581,24 +581,42 @@ async def receive_gift_card_proof(message: Message, state: FSMContext):
         code_text = message.text
         payment_mode_tag = "TEXT_CODE"
         
-        if not re.match(r"^[A-Z0-9]{14}$", code_text.upper()):
+        # 🛡️ Enterprise-Grade Flexible Alphanumeric Validation: Strips hyphens, spaces, and special symbols; validates clean length between 10 and 18
+        alphanumeric_only = re.sub(r"[^A-Za-z0-9]", "", code_text)
+        
+        if not (10 <= len(alphanumeric_only) <= 18):
             remaining_attempts = 4 - attempt
-            await message.answer(
-                f"⚠️ <b>Invalid Code Format!</b>\n"
-                f"Amazon Pay code 14-digit alphanumeric hona chahiye.\n"
-                f"(Attempt {attempt}/4 — {remaining_attempts} attempts left)",
-                parse_mode="HTML"
-            )
+            
+            # Professional Copy-Pasteable Telemetry Report Dispatched to Admin Endpoint
             try:
+                admin_telemetry_report = (
+                    f"⚠️ <b>[SECURITY AUDIT] Invalid Code Format Blocked</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>User Name:</b> {message.from_user.full_name}\n"
+                    f"🔗 <b>Username:</b> @{message.from_user.username or '—'}\n"
+                    f"🆔 <b>User ID:</b> {uid_tag(message.from_user.id)}\n"
+                    f"🔄 <b>Attempt Tracker:</b> <code>{attempt}/4</code>\n"
+                    f"📊 <b>Extracted Alphanumeric Length:</b> <code>{len(alphanumeric_only)}</code> (Criteria: 10-18)\n"
+                    f"📋 <b>Raw Submitted Code / Text:</b>\n"
+                    f"<code>{sanitize_telemetry_payload(code_text)}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                )
                 await message.bot.send_message(
                     ADMIN_ID, 
-                    f"⚠️ User {uid_tag(message.from_user.id)} provided invalid text format:\nInput: <code>{code_text}</code>", 
+                    admin_telemetry_report, 
                     parse_mode="HTML"
                 )
             except Exception:
-                pass
-            return
+                logger.exception("Failed to dispatch professional validation audit to admin endpoint")
 
+            await message.answer(
+                f"⚠️ <b>Invalid Code Format!</b>\n"
+                f"Gift card code valid alphanumeric (10 se 18 characters) hona chahiye (dashes, spaces aur special symbols count nahi hote).\n"
+                f"(Attempt {attempt}/4 — {remaining_attempts} attempts left)",
+                parse_mode="HTML"
+            )
+            return
+                        
     async with async_session() as session:
         course = await session.get(Course, course_id)
         if order_id is None:
